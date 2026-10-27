@@ -273,13 +273,15 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) Save() error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	c.mu.Lock()
+	if c.path == "" {
+		c.path = GetConfigPath()
+	}
 	p := c.path
-	if p == "" {
-		p = GetConfigPath()
-		c.path = p
+	data, err := json.MarshalIndent(c, "", "  ")
+	c.mu.Unlock()
+	if err != nil {
+		return err
 	}
 
 	dir := filepath.Dir(p)
@@ -289,17 +291,33 @@ func (c *Config) Save() error {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	data, err := json.MarshalIndent(c, "", "  ")
+	// Atomic write: write to temp file, sync, close, then rename
+	tmpPath := p + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, permFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create temporary config file: %w", err)
 	}
-
-	if err := os.WriteFile(p, data, permFile); err != nil {
-		return err
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to write config data: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to sync config file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to close config file: %w", err)
 	}
 	if runtime.GOOS != "windows" {
-		_ = os.Chmod(p, permFile)
+		_ = os.Chmod(tmpPath, permFile)
 		_ = os.Chmod(dir, permDir)
+	}
+	if err := os.Rename(tmpPath, p); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to atomically commit config file: %w", err)
 	}
 
 	// On Windows, mirror to ProgramData so background scheduled tasks/services can access it
@@ -308,7 +326,13 @@ func (c *Config) Save() error {
 			pdPath := filepath.Join(programData, "smartnet", "config.json")
 			if !strings.EqualFold(p, pdPath) {
 				_ = os.MkdirAll(filepath.Dir(pdPath), 0700)
-				_ = os.WriteFile(pdPath, data, 0600)
+				pdTmp := pdPath + ".tmp"
+				if pf, err := os.OpenFile(pdTmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
+					_, _ = pf.Write(data)
+					_ = pf.Sync()
+					_ = pf.Close()
+					_ = os.Rename(pdTmp, pdPath)
+				}
 			}
 		}
 	}
@@ -317,6 +341,8 @@ func (c *Config) Save() error {
 }
 
 func (c *Config) GetPath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.path
 }
 
@@ -349,6 +375,9 @@ func (c *Config) AddProfile(p *Profile) error {
 		p.Bootstrap = []string{"1.1.1.1:53", "8.8.8.8:53"}
 	}
 	c.Profiles[p.Name] = p
+	if c.ActiveProfile == "" {
+		c.ActiveProfile = p.Name
+	}
 	return nil
 }
 
@@ -360,6 +389,7 @@ func (c *Config) RemoveProfile(name string) error {
 	}
 	delete(c.Profiles, name)
 	if c.ActiveProfile == name {
+		c.ActiveProfile = ""
 		for k := range c.Profiles {
 			c.ActiveProfile = k
 			break

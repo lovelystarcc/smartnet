@@ -74,3 +74,22 @@ func TestDecodeOEM(t *testing.T) {
 	}
 }
 
+func TestEscapePowerShellString(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Wi-Fi", "Wi-Fi"},
+		{"Timur's iPhone", "Timur''s iPhone"},
+		{"Adapter's 'Special' Net", "Adapter''s ''Special'' Net"},
+		{"Normal_Ethernet", "Normal_Ethernet"},
+	}
+
+	for _, tt := range tests {
+		got := escapePowerShellString(tt.input)
+		if got != tt.expected {
+			t.Errorf("escapePowerShellString(%q) = %q; want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+

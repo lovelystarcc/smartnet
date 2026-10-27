@@ -69,13 +69,13 @@ func normalizeDomain(domain string) string {
 func MatchesRule(domain, pattern string) bool {
 	d := normalizeDomain(domain)
 	p := normalizeDomain(pattern)
-	if d == p {
-		return true
+	if strings.HasPrefix(p, "*.") {
+		p = p[1:]
 	}
 	if strings.HasPrefix(p, ".") {
-		return strings.HasSuffix(d, p)
+		return d == p[1:] || strings.HasSuffix(d, p)
 	}
-	return strings.HasSuffix(d, "."+p)
+	return d == p || strings.HasSuffix(d, "."+p)
 }
 
 // IsLocalOrCaptive checks if domain is local or a captive portal check

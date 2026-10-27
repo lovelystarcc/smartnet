@@ -14,7 +14,10 @@ import (
 	"unicode/utf8"
 )
 
-const ResolvConfBackup = "/etc/resolv.conf.smartnet.bak"
+const (
+	ResolvConfBackup        = "/etc/resolv.conf.smartnet.bak"
+	ResolvConfSymlinkBackup = "/etc/resolv.conf.smartnet.symlink"
+)
 
 func runElevatedCommand(name string, args ...string) ([]byte, error) {
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
@@ -242,8 +245,14 @@ func linuxSetDNSServers(iface string, servers ...string) error {
 		_, _ = runElevatedCommand("resolvectl", "domain", iface, "~.")
 	}
 
-	// 2. Backup original /etc/resolv.conf if not already backed up
-	if _, err := os.Stat(ResolvConfBackup); os.IsNotExist(err) {
+	// 2. Backup original /etc/resolv.conf (preserve symlink target if it was a symlink)
+	target, linkErr := os.Readlink("/etc/resolv.conf")
+	if linkErr == nil && target != "" {
+		if _, err := os.Stat(ResolvConfSymlinkBackup); os.IsNotExist(err) {
+			script := fmt.Sprintf("echo '%s' > %s", target, ResolvConfSymlinkBackup)
+			_, _ = runElevatedCommand("sh", "-c", script)
+		}
+	} else if _, err := os.Stat(ResolvConfBackup); os.IsNotExist(err) {
 		if _, err := os.Stat("/etc/resolv.conf"); err == nil {
 			_, _ = runElevatedCommand("cp", "-L", "/etc/resolv.conf", ResolvConfBackup)
 		}
@@ -292,14 +301,24 @@ func linuxResetDNSServers(iface string) error {
 		_, _ = runElevatedCommand("resolvectl", "revert", iface)
 	}
 
-	// 2. Restore backup if exists
+	// 2. Restore symlink if original /etc/resolv.conf was a symlink
+	if symlinkTargetBytes, err := os.ReadFile(ResolvConfSymlinkBackup); err == nil {
+		target := strings.TrimSpace(string(symlinkTargetBytes))
+		if target != "" {
+			script := fmt.Sprintf("ln -sf %s /etc/resolv.conf && rm -f %s %s", target, ResolvConfSymlinkBackup, ResolvConfBackup)
+			_, err := runElevatedCommand("sh", "-c", script)
+			return err
+		}
+	}
+
+	// 3. Restore regular file backup if exists
 	if _, err := os.Stat(ResolvConfBackup); err == nil {
 		script := fmt.Sprintf("cp %s /etc/resolv.conf && rm -f %s", ResolvConfBackup, ResolvConfBackup)
 		_, err := runElevatedCommand("sh", "-c", script)
 		return err
 	}
 
-	// 3. Fallback: If systemd-resolved stub exists
+	// 4. Fallback: If systemd-resolved stub exists
 	if _, err := os.Stat("/run/systemd/resolve/stub-resolv.conf"); err == nil {
 		script := "ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf"
 		_, err := runElevatedCommand("sh", "-c", script)
@@ -511,9 +530,14 @@ func windowsActiveInterface() (string, error) {
 	return "Wi-Fi", nil
 }
 
+func escapePowerShellString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 func windowsGetDNSServers(iface string) ([]string, error) {
 	// 1. Try PowerShell Get-DnsClientServerAddress with UTF-8
-	psCmd := fmt.Sprintf(`$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $alias = '%s'; $adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue; if ($adapter) { (Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses } else { (Get-DnsClientServerAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses }`, iface)
+	escapedAlias := escapePowerShellString(iface)
+	psCmd := fmt.Sprintf(`$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $alias = '%s'; $adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue; if ($adapter) { (Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses } else { (Get-DnsClientServerAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses }`, escapedAlias)
 	cmdPS := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd)
 	hideWindow(cmdPS)
 	if outPS, errPS := cmdPS.Output(); errPS == nil {
@@ -574,11 +598,12 @@ func windowsSetDNSServers(iface string, servers ...string) error {
 	}
 
 	// 1. Try modern PowerShell Set-DnsClientServerAddress with UTF-8
-	psArray := fmt.Sprintf("@('%s')", primary)
+	escapedAlias := escapePowerShellString(iface)
+	psArray := fmt.Sprintf("@('%s')", escapePowerShellString(primary))
 	if secondary != "" {
-		psArray = fmt.Sprintf("@('%s', '%s')", primary, secondary)
+		psArray = fmt.Sprintf("@('%s', '%s')", escapePowerShellString(primary), escapePowerShellString(secondary))
 	}
-	psCmd := fmt.Sprintf(`$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $alias = '%s'; $addrs = %s; $adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue; if ($adapter) { Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $addrs -ErrorAction Stop; Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv6 -ResetServerAddresses -ErrorAction SilentlyContinue } else { Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $addrs -ErrorAction Stop }`, iface, psArray)
+	psCmd := fmt.Sprintf(`$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $alias = '%s'; $addrs = %s; $adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue; if ($adapter) { Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $addrs -ErrorAction Stop; Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv6 -ResetServerAddresses -ErrorAction SilentlyContinue } else { Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $addrs -ErrorAction Stop }`, escapedAlias, psArray)
 	cmdPS := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd)
 	hideWindow(cmdPS)
 	if outPS, errPS := cmdPS.CombinedOutput(); errPS == nil {
@@ -602,7 +627,8 @@ func windowsSetDNSServers(iface string, servers ...string) error {
 
 func windowsResetDNSServers(iface string) error {
 	// 1. Try PowerShell Set-DnsClientServerAddress -ResetServerAddresses with UTF-8
-	psCmd := fmt.Sprintf(`$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $alias = '%s'; $adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue; if ($adapter) { Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ResetServerAddresses -ErrorAction Stop } else { Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses -ErrorAction Stop }`, iface)
+	escapedAlias := escapePowerShellString(iface)
+	psCmd := fmt.Sprintf(`$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $alias = '%s'; $adapter = Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue; if ($adapter) { Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ResetServerAddresses -ErrorAction Stop } else { Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses -ErrorAction Stop }`, escapedAlias)
 	cmdPS := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd)
 	hideWindow(cmdPS)
 	if err := cmdPS.Run(); err == nil {

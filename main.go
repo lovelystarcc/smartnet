@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -33,7 +35,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-const Version = "2.0.9"
+const Version = "2.1.0"
 
 func printHelp() {
 	fmt.Printf(`%sSmartNet CLI v%s%s — DNS, VLESS-Reality VPN & Transparent TUN Proxy
@@ -662,7 +664,11 @@ Examples:
 		os.Exit(1)
 	}
 
-	fmt.Printf("%sProfile '%s' added successfully!%s\n", tester.Green, name, tester.Reset)
+	if cfg.ActiveProfile == name {
+		fmt.Printf("%sProfile '%s' added successfully and set as active!%s\n", tester.Green, name, tester.Reset)
+	} else {
+		fmt.Printf("%sProfile '%s' added successfully!%s\n", tester.Green, name, tester.Reset)
+	}
 }
 
 func handleRemove() {
@@ -789,7 +795,7 @@ func handleService() {
 			fmt.Printf("%sError: %v%s\n", tester.Red, err, tester.Reset)
 			os.Exit(1)
 		}
-		fmt.Printf("%sService removed from system.%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sService removed from system and DNS restored to default.%s\n", tester.Green, tester.Reset)
 
 	case "start":
 		if err := service.Start(); err != nil {
@@ -803,7 +809,7 @@ func handleService() {
 			fmt.Printf("%sError: %v%s\n", tester.Red, err, tester.Reset)
 			os.Exit(1)
 		}
-		fmt.Printf("%sService stopped.%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sService stopped and DNS restored to default.%s\n", tester.Green, tester.Reset)
 
 	case "restart":
 		if err := service.Restart(); err != nil {
@@ -942,6 +948,15 @@ func handleDaemon() {
 		}
 		srv.Stop()
 		proxySrv.Stop()
+
+		// Revert DNS to DHCP on clean daemon termination if system DNS was pointing to localhost
+		if iface, errNet := network.ActiveInterface(); errNet == nil {
+			if service.IsSystemDNSSet(iface) {
+				log.Printf("[smartnet] Reverting system DNS on %s to DHCP...", iface)
+				_ = network.ResetDNSServers(iface)
+				network.FlushDNSCache()
+			}
+		}
 		break
 	}
 }
@@ -1213,6 +1228,7 @@ func handleUpdate() {
 		legacyBinName += ".exe"
 	}
 
+	selectedAsset := binName
 	downloadURL := fmt.Sprintf("https://github.com/lovelystarcc/smartnet/releases/latest/download/%s", binName)
 	resp, err := http.Get(downloadURL)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -1220,6 +1236,7 @@ func handleUpdate() {
 			_ = resp.Body.Close()
 		}
 		fallbackURL := fmt.Sprintf("https://github.com/lovelystarcc/smartnet/releases/latest/download/%s", legacyBinName)
+		selectedAsset = legacyBinName
 		resp, err = http.Get(fallbackURL)
 	}
 
@@ -1244,13 +1261,49 @@ func handleUpdate() {
 		os.Exit(1)
 	}
 
-	if _, err := io.Copy(out, resp.Body); err != nil {
+	hasher := sha256.New()
+	mw := io.MultiWriter(out, hasher)
+	if _, err := io.Copy(mw, resp.Body); err != nil {
 		out.Close()
 		_ = os.Remove(tmpFile)
 		fmt.Printf("%sFailed to save update: %v%s\n", tester.Red, err, tester.Reset)
 		os.Exit(1)
 	}
 	out.Close()
+
+	actualSHA256 := hex.EncodeToString(hasher.Sum(nil))
+
+	// Verify checksum against releases checksums.txt
+	checksumURL := "https://github.com/lovelystarcc/smartnet/releases/latest/download/checksums.txt"
+	cResp, cErr := http.Get(checksumURL)
+	if cErr == nil && cResp.StatusCode == http.StatusOK {
+		defer cResp.Body.Close()
+		cData, _ := io.ReadAll(io.LimitReader(cResp.Body, 65536))
+		var expectedSHA256 string
+		for _, line := range strings.Split(string(cData), "\n") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 && parts[1] == selectedAsset {
+				expectedSHA256 = strings.ToLower(parts[0])
+				break
+			}
+		}
+		if expectedSHA256 != "" {
+			if !strings.EqualFold(expectedSHA256, actualSHA256) {
+				_ = os.Remove(tmpFile)
+				fmt.Printf("%sSecurity Error: Checksum verification failed for %s!\nExpected: %s\nActual:   %s\nUpdate aborted.%s\n",
+					tester.Red, selectedAsset, expectedSHA256, actualSHA256, tester.Reset)
+				os.Exit(1)
+			}
+			fmt.Printf("%sChecksum verified: SHA256 %s%s\n", tester.Cyan, actualSHA256[:16]+"...", tester.Reset)
+		} else {
+			fmt.Printf("%sWarning: Checksum for %s not found in checksums.txt.%s\n", tester.Yellow, selectedAsset, tester.Reset)
+		}
+	} else {
+		if cResp != nil {
+			_ = cResp.Body.Close()
+		}
+		fmt.Printf("%sWarning: Could not fetch checksums.txt to verify binary integrity.%s\n", tester.Yellow, tester.Reset)
+	}
 
 	// On macOS: apply ad-hoc codesign
 	if runtime.GOOS == "darwin" {

@@ -2,7 +2,11 @@ package resolver
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -132,11 +136,31 @@ func TestResolveViaBootstrap(t *testing.T) {
 }
 
 func TestBackupUpstreamFailover(t *testing.T) {
+	// Start mock backup DoH server
+	backupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		reqMsg := new(dns.Msg)
+		_ = reqMsg.Unpack(body)
+
+		resp := new(dns.Msg)
+		resp.SetReply(reqMsg)
+		resp.Answer = []dns.RR{
+			&dns.A{
+				Hdr: dns.RR_Header{Name: reqMsg.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+				A:   net.ParseIP("93.184.216.34"),
+			},
+		}
+		wire, _ := resp.Pack()
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(wire)
+	}))
+	defer backupServer.Close()
+
 	cfg := config.DefaultConfig()
 	_ = cfg.AddProfile(&config.Profile{
 		Name:           "with-backup",
-		Upstream:       "https://127.0.0.1:59999/dns-query",
-		BackupUpstream: "https://1.1.1.1/dns-query",
+		Upstream:       "http://127.0.0.1:59999/dns-query",
+		BackupUpstream: backupServer.URL,
 	})
 	_ = cfg.SetActive("with-backup")
 
@@ -145,12 +169,15 @@ func TestBackupUpstreamFailover(t *testing.T) {
 	req := new(dns.Msg)
 	req.SetQuestion("google.com.", dns.TypeA)
 
-	resp, err := s.queryDoHWithTimeout(req, "https://1.1.1.1/dns-query", 2*time.Second)
-	if err != nil {
-		t.Fatalf("queryDoHWithTimeout to backup upstream failed: %v", err)
+	w := &mockDNSWriter{}
+	s.handleDNS(w, req)
+
+	if w.msg == nil || len(w.msg.Answer) == 0 {
+		t.Fatalf("expected non-empty response from backup DoH, got %v", w.msg)
 	}
-	if resp == nil || len(resp.Answer) == 0 {
-		t.Fatalf("expected non-empty response from backup DoH, got %v", resp)
+	aRecord, ok := w.msg.Answer[0].(*dns.A)
+	if !ok || !aRecord.A.Equal(net.ParseIP("93.184.216.34")) {
+		t.Fatalf("expected answer 93.184.216.34, got %v", w.msg.Answer)
 	}
 }
 
@@ -262,6 +289,118 @@ func TestCacheTTLDecrementAndMinTTL(t *testing.T) {
 		if ttl > 2 {
 			t.Errorf("record %d TTL should be decremented to <= 2, got %d", i, ttl)
 		}
+	}
+}
+
+func TestStopIdempotent(t *testing.T) {
+	cfg := config.DefaultConfig()
+	s := New(cfg)
+
+	// Calling Stop multiple times must not panic
+	s.Stop()
+	s.Stop()
+}
+
+func TestQueryFallbackIgnoresServfail(t *testing.T) {
+	// Listener 1: returns SERVFAIL immediately
+	pc1, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket 1 failed: %v", err)
+	}
+	defer pc1.Close()
+
+	srv1 := &dns.Server{
+		PacketConn: pc1,
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			m := new(dns.Msg)
+			m.SetRcode(r, dns.RcodeServerFailure)
+			_ = w.WriteMsg(m)
+		}),
+	}
+	go func() { _ = srv1.ActivateAndServe() }()
+	defer func() { _ = srv1.Shutdown() }()
+
+	// Listener 2: returns NOERROR with an A record after a slight delay
+	pc2, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket 2 failed: %v", err)
+	}
+	defer pc2.Close()
+
+	srv2 := &dns.Server{
+		PacketConn: pc2,
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			time.Sleep(30 * time.Millisecond)
+			m := new(dns.Msg)
+			m.SetReply(r)
+			m.Answer = []dns.RR{
+				&dns.A{
+					Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   net.ParseIP("1.2.3.4"),
+				},
+			}
+			_ = w.WriteMsg(m)
+		}),
+	}
+	go func() { _ = srv2.ActivateAndServe() }()
+	defer func() { _ = srv2.Shutdown() }()
+
+	cfg := config.DefaultConfig()
+	s := New(cfg)
+	s.fallbackServers = []string{pc1.LocalAddr().String(), pc2.LocalAddr().String()}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.test.", dns.TypeA)
+
+	resp, err := s.queryFallback(req)
+	if err != nil {
+		t.Fatalf("expected queryFallback to succeed despite first server SERVFAIL, got error: %v", err)
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected RcodeSuccess from second server, got rcode: %d", resp.Rcode)
+	}
+	if len(resp.Answer) == 0 {
+		t.Fatalf("expected non-empty answers in response")
+	}
+}
+
+func TestQueryDoHOverlongBodyRejected(t *testing.T) {
+	// Start an HTTP server that returns > 65535 bytes
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				_, _ = c.Read(buf)
+				// Write HTTP OK response with 70,000 bytes
+				body := make([]byte, 70000)
+				respHdr := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: %d\r\n\r\n", len(body))
+				_, _ = c.Write([]byte(respHdr))
+				_, _ = c.Write(body)
+			}(conn)
+		}
+	}()
+
+	cfg := config.DefaultConfig()
+	s := New(cfg)
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.test.", dns.TypeA)
+
+	dohURL := "http://" + ln.Addr().String() + "/dns-query"
+	_, err = s.queryDoHWithTimeout(req, dohURL, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected error for DoH response exceeding 65535 bytes, got nil")
 	}
 }
 

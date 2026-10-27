@@ -77,6 +77,10 @@ func ParseURL(rawURL string) (*config.VLESSConfig, error) {
 		return nil, fmt.Errorf("unsupported VLESS flow %q: xtls-rprx-vision is not supported, configure VLESS without flow", cfg.Flow)
 	}
 
+	if len(cfg.ShortID) > 16 {
+		return nil, fmt.Errorf("invalid reality short_id %q: maximum length is 16 hex characters (8 bytes)", cfg.ShortID)
+	}
+
 	if cfg.ServerName == "" {
 		cfg.ServerName = server
 	}
@@ -152,67 +156,104 @@ func (d *Dialer) DialContext(ctx context.Context, network, target string) (net.C
 	return &vlessConn{Conn: tlsConn, isUDP: isUDP}, nil
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 type vlessConn struct {
 	net.Conn
-	mu         sync.Mutex
-	headerRead bool
-	isUDP      bool
-	udpBuf     []byte
+	mu           sync.Mutex
+	writeMu      sync.Mutex
+	headerRead   bool
+	isUDP        bool
+	udpBuf       []byte
+	closeWritten bool
+}
+
+func (c *vlessConn) CloseWrite() error {
+	c.mu.Lock()
+	c.closeWritten = true
+	c.mu.Unlock()
+
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 }
 
 func (c *vlessConn) Read(b []byte) (int, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if !c.headerRead {
 		respHdr := make([]byte, 2)
 		if _, err := io.ReadFull(c.Conn, respHdr); err != nil {
+			c.mu.Unlock()
 			return 0, fmt.Errorf("failed to read VLESS response header: %w", err)
 		}
 		if respHdr[0] != 0x00 {
+			c.mu.Unlock()
 			return 0, fmt.Errorf("unsupported VLESS response version: %d", respHdr[0])
 		}
 		addonLen := int(respHdr[1])
 		if addonLen > 0 {
 			addonBuf := make([]byte, addonLen)
 			if _, err := io.ReadFull(c.Conn, addonBuf); err != nil {
+				c.mu.Unlock()
 				return 0, fmt.Errorf("failed to read VLESS addon bytes: %w", err)
 			}
 		}
 		c.headerRead = true
+	}
+	closeWritten := c.closeWritten
+	c.mu.Unlock()
+
+	if closeWritten {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	}
 
 	if !c.isUDP {
 		return c.Conn.Read(b)
 	}
 
-	// For UDP: return remaining buffered bytes from an earlier read
-	if len(c.udpBuf) > 0 {
-		n := copy(b, c.udpBuf)
-		c.udpBuf = c.udpBuf[n:]
-		return n, nil
-	}
-
-	// Read 2-byte datagram length prefix
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(c.Conn, lenBuf[:]); err != nil {
-		return 0, err
-	}
-	packetLen := int(binary.BigEndian.Uint16(lenBuf[:]))
-	if packetLen == 0 {
+	if len(b) == 0 {
 		return 0, nil
 	}
 
-	packet := make([]byte, packetLen)
-	if _, err := io.ReadFull(c.Conn, packet); err != nil {
-		return 0, err
-	}
+	for {
+		c.mu.Lock()
+		if len(c.udpBuf) > 0 {
+			n := copy(b, c.udpBuf)
+			c.udpBuf = c.udpBuf[n:]
+			c.mu.Unlock()
+			return n, nil
+		}
+		c.mu.Unlock()
 
-	n := copy(b, packet)
-	if n < packetLen {
-		c.udpBuf = packet[n:]
+		// Read 2-byte datagram length prefix
+		var lenBuf [2]byte
+		if _, err := io.ReadFull(c.Conn, lenBuf[:]); err != nil {
+			return 0, err
+		}
+		packetLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+		if packetLen == 0 {
+			continue
+		}
+
+		packet := make([]byte, packetLen)
+		if _, err := io.ReadFull(c.Conn, packet); err != nil {
+			return 0, err
+		}
+
+		c.mu.Lock()
+		if c.closeWritten {
+			_ = c.Conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		}
+		n := copy(b, packet)
+		if n < packetLen {
+			c.udpBuf = packet[n:]
+		}
+		c.mu.Unlock()
+		return n, nil
 	}
-	return n, nil
 }
 
 func (c *vlessConn) Write(b []byte) (int, error) {
@@ -229,14 +270,18 @@ func (c *vlessConn) Write(b []byte) (int, error) {
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(b)))
 	copy(frame[2:], b)
 
-	n, err := c.Conn.Write(frame)
-	if err != nil {
-		return 0, err
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	var written int
+	for written < len(frame) {
+		n, err := c.Conn.Write(frame[written:])
+		if err != nil {
+			return 0, err
+		}
+		written += n
 	}
-	if n < 2 {
-		return 0, io.ErrShortWrite
-	}
-	return n - 2, nil
+	return len(b), nil
 }
 
 func parseUUID(uuidStr string) ([]byte, error) {
@@ -307,6 +352,9 @@ func realityHandshake(ctx context.Context, rawConn net.Conn, cfg *config.VLESSCo
 		if err != nil {
 			return nil, fmt.Errorf("invalid reality short_id hex: %w", err)
 		}
+		if len(shortIDBytes) > 8 {
+			return nil, fmt.Errorf("reality short_id exceeds 8 bytes (16 hex characters): got %d bytes", len(shortIDBytes))
+		}
 	}
 
 	var verified bool
@@ -352,7 +400,7 @@ func realityHandshake(ctx context.Context, rawConn net.Conn, cfg *config.VLESSCo
 	hello.SessionId[3] = 0
 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 	if len(shortIDBytes) > 0 {
-		copy(hello.SessionId[8:], shortIDBytes)
+		copy(hello.SessionId[8:16], shortIDBytes)
 	}
 
 	publicKey, err := ecdh.X25519().NewPublicKey(pubKeyBytes)

@@ -216,6 +216,10 @@ func (st *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	go st.forwardTCP(conn, destIP, destPort)
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 func (st *Stack) forwardTCP(localConn net.Conn, destIP net.IP, destPort uint16) {
 	defer localConn.Close()
 
@@ -239,16 +243,20 @@ func (st *Stack) forwardTCP(localConn net.Conn, destIP net.IP, destPort uint16) 
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(remoteConn, localConn)
-		if tc, ok := remoteConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
+		if cw, ok := remoteConn.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = remoteConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(localConn, remoteConn)
-		if tc, ok := localConn.(*gonet.TCPConn); ok {
-			_ = tc.CloseWrite()
+		if cw, ok := localConn.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = localConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		}
 	}()
 

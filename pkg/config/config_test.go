@@ -117,6 +117,22 @@ func TestRemoveProfile(t *testing.T) {
 	if cfg.ActiveProfile != "p3" {
 		t.Errorf("expected active profile to fallback to p3, got %q", cfg.ActiveProfile)
 	}
+
+	// Removing the last remaining profile should reset ActiveProfile to ""
+	if err := cfg.RemoveProfile("p3"); err != nil {
+		t.Fatalf("unexpected error removing last profile p3: %v", err)
+	}
+	if cfg.ActiveProfile != "" {
+		t.Errorf("expected active profile to be empty after removing last profile, got %q", cfg.ActiveProfile)
+	}
+
+	// Adding a profile when ActiveProfile is empty should set it active
+	if err := cfg.AddProfile(&Profile{Name: "pNew", Upstream: "https://new.example/dns-query"}); err != nil {
+		t.Fatalf("unexpected error adding pNew: %v", err)
+	}
+	if cfg.ActiveProfile != "pNew" {
+		t.Errorf("expected active profile to be set to pNew, got %q", cfg.ActiveProfile)
+	}
 }
 
 func TestSaveAndLoad(t *testing.T) {

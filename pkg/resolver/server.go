@@ -20,6 +20,7 @@ import (
 	"smartnet/pkg/rules"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/singleflight"
 )
 
 type UpstreamState int
@@ -56,11 +57,14 @@ type Server struct {
 	udpServer *dns.Server
 	tcpServer *dns.Server
 	stopCh    chan struct{}
+	stopOnce  sync.Once
+	sf        singleflight.Group
 
 	// Health and Fallback state
 	stateMu          sync.RWMutex
 	state            UpstreamState
 	consecutiveFails int
+	fallbackServers  []string
 }
 
 func New(cfg *config.Config) *Server {
@@ -203,6 +207,9 @@ func resolveViaBootstrap(ctx context.Context, host string, bootstraps []string) 
 }
 
 func (s *Server) getFallbackServers() []string {
+	if len(s.fallbackServers) > 0 {
+		return s.fallbackServers
+	}
 	servers := []string{"1.1.1.1:53", "8.8.8.8:53", "77.88.8.8:53"}
 	if gw := network.GetPhysicalGateway(); gw != "" {
 		servers = append([]string{gw + ":53"}, servers...)
@@ -292,16 +299,18 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() {
-	close(s.stopCh)
-	if s.udpServer != nil {
-		_ = s.udpServer.Shutdown()
-	}
-	if s.tcpServer != nil {
-		_ = s.tcpServer.Shutdown()
-	}
-	if s.transport != nil {
-		s.transport.CloseIdleConnections()
-	}
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		if s.udpServer != nil {
+			_ = s.udpServer.Shutdown()
+		}
+		if s.tcpServer != nil {
+			_ = s.tcpServer.Shutdown()
+		}
+		if s.transport != nil {
+			s.transport.CloseIdleConnections()
+		}
+	})
 }
 
 func (s *Server) cleanCacheLoop() {
@@ -403,15 +412,25 @@ func (s *Server) queryFallback(r *dns.Msg) (*dns.Msg, error) {
 	}
 
 	var lastErr error
+	var lastMsg *dns.Msg
 	for i := 0; i < len(fallbacks); i++ {
 		select {
 		case res := <-ch:
 			if res.err == nil && res.msg != nil {
-				cancel()
-				return res.msg, nil
+				// Accept success or NXDOMAIN as definitive responses
+				if res.msg.Rcode == dns.RcodeSuccess || res.msg.Rcode == dns.RcodeNameError {
+					cancel()
+					return res.msg, nil
+				}
+				// Save transient/refusal message but keep waiting for other fallbacks to succeed
+				lastMsg = res.msg
+			} else if res.err != nil {
+				lastErr = res.err
 			}
-			lastErr = res.err
 		case <-ctx.Done():
+			if lastMsg != nil {
+				return lastMsg, nil
+			}
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -419,6 +438,9 @@ func (s *Server) queryFallback(r *dns.Msg) (*dns.Msg, error) {
 		}
 	}
 
+	if lastMsg != nil {
+		return lastMsg, nil
+	}
 	if lastErr != nil {
 		return nil, lastErr
 	}
@@ -589,64 +611,83 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	// 3. Check circuit breaker state
-	s.stateMu.RLock()
-	currentState := s.state
-	s.stateMu.RUnlock()
-
-	var resp *dns.Msg
-	var err error
-	usedFallback := false
-
-	if currentState == StateHealthy && active != nil && active.Upstream != "" {
-		// Normal path: Query Primary DoH with a 2.5s timeout
-		resp, err = s.queryDoHWithTimeout(r, active.Upstream, 2500*time.Millisecond)
-		if err != nil {
-			log.Printf("[smartnet] Upstream DoH error for %s (%v)", q.Name, err)
-			s.recordFailure(active.Upstream)
-
-			// Try secondary DoH if configured
-			if active.BackupUpstream != "" {
-				backupResp, backupErr := s.queryDoHWithTimeout(r, active.BackupUpstream, 2000*time.Millisecond)
-				if backupErr == nil && backupResp != nil {
-					resp = backupResp
-				}
-			}
-
-			// If secondary DoH also failed or wasn't configured, failover to parallel fallback
-			if resp == nil {
-				resp, err = s.queryFallback(r)
-				usedFallback = true
-				if err != nil {
-					log.Printf("[smartnet] Fallback failed for %s: %v", q.Name, err)
-					dns.HandleFailed(w, r)
-					return
-				}
-			}
-		} else {
-			s.recordSuccess(active.Upstream)
-		}
-	} else {
-		// Circuit breaker tripped or no primary profile:
-		// Try backup DoH if available before falling back to unencrypted DNS
-		if active != nil && active.BackupUpstream != "" {
-			resp, _ = s.queryDoHWithTimeout(r, active.BackupUpstream, 1500*time.Millisecond)
-		}
-		if resp == nil {
-			// Go straight to fallback to avoid timeout latency
-			resp, err = s.queryFallback(r)
-			usedFallback = true
-			if err != nil {
-				log.Printf("[smartnet] Fallback query failed for %s: %v", q.Name, err)
-				dns.HandleFailed(w, r)
-				return
-			}
-		}
+	// 4. Resolve via singleflight deduplication to prevent thundering herds
+	type queryResult struct {
+		resp *dns.Msg
 	}
 
-	// 4. Cache response (short 5s TTL for fallback to prevent sticking to Direct IP)
-	s.cacheResponse(cacheKey, resp, usedFallback)
+	val, err, _ := s.sf.Do(cacheKey, func() (any, error) {
+		// Double check cache inside singleflight
+		s.cacheMu.RLock()
+		cached, exists := s.cache[cacheKey]
+		s.cacheMu.RUnlock()
+		if exists && time.Now().Before(cached.expires) {
+			return queryResult{resp: cached.msg.Copy()}, nil
+		}
 
+		s.stateMu.RLock()
+		currentState := s.state
+		s.stateMu.RUnlock()
+
+		var qResp *dns.Msg
+		var qErr error
+		usedFallback := false
+
+		if currentState == StateHealthy && active != nil && active.Upstream != "" {
+			// Normal path: Query Primary DoH with a 2.5s timeout
+			qResp, qErr = s.queryDoHWithTimeout(r, active.Upstream, 2500*time.Millisecond)
+			if qErr != nil {
+				log.Printf("[smartnet] Upstream DoH error for %s (%v)", q.Name, qErr)
+				s.recordFailure(active.Upstream)
+
+				// Try secondary DoH if configured
+				if active.BackupUpstream != "" {
+					backupResp, backupErr := s.queryDoHWithTimeout(r, active.BackupUpstream, 2000*time.Millisecond)
+					if backupErr == nil && backupResp != nil {
+						qResp = backupResp
+					}
+				}
+
+				// If secondary DoH also failed or wasn't configured, failover to parallel fallback
+				if qResp == nil {
+					qResp, qErr = s.queryFallback(r)
+					usedFallback = true
+					if qErr != nil {
+						return nil, qErr
+					}
+				}
+			} else {
+				s.recordSuccess(active.Upstream)
+			}
+		} else {
+			// Circuit breaker tripped or no primary profile:
+			// Try backup DoH if available before falling back to unencrypted DNS
+			if active != nil && active.BackupUpstream != "" {
+				qResp, _ = s.queryDoHWithTimeout(r, active.BackupUpstream, 1500*time.Millisecond)
+			}
+			if qResp == nil {
+				// Go straight to fallback to avoid timeout latency
+				qResp, qErr = s.queryFallback(r)
+				usedFallback = true
+				if qErr != nil {
+					return nil, qErr
+				}
+			}
+		}
+
+		// Cache response (short 5s TTL for fallback to prevent sticking to Direct IP)
+		s.cacheResponse(cacheKey, qResp, usedFallback)
+		return queryResult{resp: qResp}, nil
+	})
+
+	if err != nil || val == nil {
+		log.Printf("[smartnet] DNS resolution failed for %s: %v", q.Name, err)
+		dns.HandleFailed(w, r)
+		return
+	}
+
+	res := val.(queryResult)
+	resp := res.resp.Copy()
 	resp.Id = r.Id
 	_ = w.WriteMsg(resp)
 }
@@ -693,9 +734,13 @@ func (s *Server) queryDoHWithTimeout(req *dns.Msg, dohURL string, timeout time.D
 		return nil, fmt.Errorf("DoH status %d: %s", httpResp.StatusCode, string(body))
 	}
 
-	respBytes, err := io.ReadAll(httpResp.Body)
+	const maxDNSMessageSize = 65535
+	respBytes, err := io.ReadAll(io.LimitReader(httpResp.Body, maxDNSMessageSize+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(respBytes) > maxDNSMessageSize {
+		return nil, fmt.Errorf("DoH response exceeded maximum DNS message size (65535 bytes)")
 	}
 
 	resp := new(dns.Msg)

@@ -219,6 +219,13 @@ func Start() error {
 }
 
 func Stop() error {
+	if iface, err := network.ActiveInterface(); err == nil {
+		if IsSystemDNSSet(iface) {
+			_ = network.ResetDNSServers(iface)
+			network.FlushDNSCache()
+		}
+	}
+
 	if runtime.GOOS == "darwin" {
 		if _, err := os.Stat(LegacyMacPlistPath); err == nil {
 			_, _ = runElevated("launchctl", "bootout", "system/"+LegacyMacLabel)

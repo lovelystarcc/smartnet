@@ -43,6 +43,10 @@ func TestShouldBypass(t *testing.T) {
 		// Custom bypass
 		{"example.com", []string{"example.com"}, nil, true},
 		{"sub.example.com", []string{"example.com"}, nil, true},
+		{"example.com", []string{"*.example.com"}, nil, true},
+		{"sub.example.com", []string{"*.example.com"}, nil, true},
+		{"deep.sub.example.com", []string{"*.example.com"}, nil, true},
+		{"notexample.com", []string{"*.example.com"}, nil, false},
 
 		// Custom force proxy override (takes precedence over bypass)
 		{"music.yandex.ru", nil, []string{"music.yandex.ru"}, false},

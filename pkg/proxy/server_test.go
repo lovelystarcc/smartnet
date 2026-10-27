@@ -179,4 +179,17 @@ func TestProxyControlEndpoints(t *testing.T) {
 	if allocAfter != 0 {
 		t.Fatalf("expected 0 allocations after clear, got %d", allocAfter)
 	}
+
+	// Verify CSRF rejection: requests bearing browser Origin or missing X-SmartNet-Local must get 403 Forbidden
+	client := &http.Client{Timeout: 1 * time.Second}
+	csrfReq, _ := http.NewRequest(http.MethodPost, "http://"+proxyAddr+"/_smartnet/fakeip/clear", nil)
+	csrfReq.Header.Set("Origin", "https://malicious-website.com")
+	csrfResp, err := client.Do(csrfReq)
+	if err != nil {
+		t.Fatalf("CSRF test request failed: %v", err)
+	}
+	defer csrfResp.Body.Close()
+	if csrfResp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected CSRF request to return HTTP 403 Forbidden, got %d", csrfResp.StatusCode)
+	}
 }

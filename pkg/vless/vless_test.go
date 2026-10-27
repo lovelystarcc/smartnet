@@ -52,6 +52,12 @@ func TestParseURL(t *testing.T) {
 		t.Error("Expected error for unsupported flow xtls-rprx-vision")
 	}
 
+	// Overlong short_id (> 16 hex chars) should be rejected
+	longSidURL := "vless://a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d@vpn.example.com:8443?security=reality&sni=gateway.icloud.com&pbk=fakePubkey123&sid=1234567890abcdef12"
+	if _, err := ParseURL(longSidURL); err == nil {
+		t.Error("Expected error for overlong short_id > 16 hex chars")
+	}
+
 	// Invalid URLs
 	if _, err := ParseURL("https://example.com"); err == nil {
 		t.Error("Expected error for non-vless scheme")
@@ -363,5 +369,40 @@ func TestRealityRejectsRogueServer(t *testing.T) {
 	_, err = dialer.Dial("tcp", "target-domain.com:443")
 	if err == nil {
 		t.Fatal("Expected Reality handshake with unauthenticated rogue server to fail, but it succeeded")
+	}
+}
+
+func TestUDPStreaming_EmptyPacketSkipped(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	vConn := &vlessConn{
+		Conn:  clientConn,
+		isUDP: true,
+	}
+
+	go func() {
+		// Server writes VLESS response header (00 00)
+		_, _ = serverConn.Write([]byte{0x00, 0x00})
+		// Server sends empty packet (00 00)
+		_, _ = serverConn.Write([]byte{0x00, 0x00})
+		// Then server sends datagram "hello" (00 05 hello)
+		respFrame := []byte{0x00, 0x05, 'h', 'e', 'l', 'l', 'o'}
+		_, _ = serverConn.Write(respFrame)
+	}()
+
+	buf := make([]byte, 64)
+	n, err := vConn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if n != 5 || string(buf[:n]) != "hello" {
+		t.Fatalf("Expected 5 bytes 'hello', got %d bytes %q", n, string(buf[:n]))
+	}
+
+	// Verify CloseWrite does not panic
+	if err := vConn.CloseWrite(); err != nil {
+		t.Logf("CloseWrite on pipe conn: %v", err)
 	}
 }

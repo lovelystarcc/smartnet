@@ -159,7 +159,13 @@ func QueryDaemonStats(proxyAddr string) (int, int, error) {
 		proxyAddr = "127.0.0.1:7890"
 	}
 	client := &http.Client{Timeout: 800 * time.Millisecond}
-	resp, err := client.Get("http://" + proxyAddr + "/_smartnet/fakeip/stats")
+	req, err := http.NewRequest(http.MethodGet, "http://"+proxyAddr+"/_smartnet/fakeip/stats", nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("X-SmartNet-Local", "1")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -183,7 +189,13 @@ func ClearDaemon(proxyAddr string) error {
 		proxyAddr = "127.0.0.1:7890"
 	}
 	client := &http.Client{Timeout: 800 * time.Millisecond}
-	resp, err := client.Post("http://"+proxyAddr+"/_smartnet/fakeip/clear", "application/json", nil)
+	req, err := http.NewRequest(http.MethodPost, "http://"+proxyAddr+"/_smartnet/fakeip/clear", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-SmartNet-Local", "1")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}

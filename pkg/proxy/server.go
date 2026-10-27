@@ -21,6 +21,10 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 type bufferedConn struct {
 	r io.Reader
 	net.Conn
@@ -28,6 +32,13 @@ type bufferedConn struct {
 
 func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
+}
+
+func (b *bufferedConn) CloseWrite() error {
+	if cw, ok := b.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 type Server struct {
@@ -263,8 +274,15 @@ func (s *Server) handleHTTP(conn net.Conn, br *bufio.Reader) {
 		return
 	}
 
-	// Internal control endpoints for daemon management (Fake-IP stats, cache clear, etc.)
+	// Internal control endpoints for daemon management (protected against browser CSRF)
 	if strings.HasPrefix(req.URL.Path, "/_smartnet/") {
+		// Enforce local CLI header and reject any browser cross-origin requests
+		if req.Header.Get("X-SmartNet-Local") != "1" || req.Header.Get("Origin") != "" || req.Header.Get("Referer") != "" {
+			_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"))
+			_ = conn.Close()
+			return
+		}
+
 		switch req.URL.Path {
 		case "/_smartnet/fakeip/stats":
 			alloc, total := fakeip.DefaultPool.Stats()
@@ -336,17 +354,23 @@ func pipe(c1, c2 net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(c1, c2)
-		_ = c1.Close()
+		_, _ = io.Copy(c2, c1)
+		if cw, ok := c2.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(c2, c1)
-		_ = c2.Close()
+		_, _ = io.Copy(c1, c2)
+		if cw, ok := c1.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
 	}()
 
 	wg.Wait()
+	_ = c1.Close()
+	_ = c2.Close()
 }
 
 // IsListening checks if local proxy port is active
