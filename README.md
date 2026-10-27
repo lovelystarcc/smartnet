@@ -93,6 +93,7 @@ smartnet fakeip on        # Independent Fake-IP engine control
 | `smartnet status` | Show full subsystem status (DNS, VPN, TUN, egress IP) |
 | `smartnet test [domains...]` | Test DNS resolution, TLS ping, and route destination |
 | `smartnet update` | Update binary to latest GitHub release |
+| `smartnet uninstall [--purge]` | Completely remove SmartNet from system (use `--purge` to delete all profiles and data) |
 | `smartnet completion <shell>` | Generate completions (`fish`, `zsh`, `bash`, `powershell`) |
 
 ### VPN (VLESS-Reality)

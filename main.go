@@ -35,7 +35,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-const Version = "2.1.0"
+const Version = "2.2.0"
 
 func printHelp() {
 	fmt.Printf(`%sSmartNet CLI v%s%s — DNS, VLESS-Reality VPN & Transparent TUN Proxy
@@ -50,6 +50,7 @@ func printHelp() {
   %sstatus%s           Show status (DNS, VPN, TUN, Egress IP)
   %stest%s [domains...] Test latency, TLS ping, and routing to domains
   %supdate%s           Update SmartNet to latest version from GitHub
+  %suninstall%s [--purge] Completely remove SmartNet from system (use --purge to delete profiles)
   %scompletion%s <sh>  Generate shell completion script (fish, zsh, bash, powershell)
 
 %sVPN & ANTI-CENSORSHIP TUNNEL (VLESS-REALITY):%s
@@ -98,6 +99,7 @@ func printHelp() {
 		tester.Cyan, tester.Reset,
 		tester.Cyan, tester.Reset,
 		tester.Cyan, tester.Reset,
+		tester.Red, tester.Reset,
 		tester.Cyan, tester.Reset,
 		tester.Bold, tester.Reset,
 		tester.Green, tester.Reset,
@@ -209,6 +211,9 @@ func main() {
 
 	case "completion":
 		handleCompletion()
+
+	case "uninstall":
+		handleUninstall()
 
 	default:
 		fmt.Printf("%sUnknown command: %s%s\n\n", tester.Red, cmd, tester.Reset)
@@ -1376,6 +1381,191 @@ func handleUpdate() {
 		_ = service.Restart()
 		fmt.Printf("%sService reloaded with the new version.%s\n", tester.Green, tester.Reset)
 	}
+}
+
+func handleUninstall() {
+	purge := false
+	for _, arg := range os.Args[2:] {
+		switch strings.ToLower(arg) {
+		case "--purge", "-p", "--all", "-a", "--clean", "--remove-data":
+			purge = true
+		}
+	}
+
+	fmt.Printf("%s==> Uninstalling SmartNet from system...%s\n", tester.Bold, tester.Reset)
+
+	// 1. Revert system DNS on the active network interface to DHCP
+	if iface, err := network.ActiveInterface(); err == nil {
+		if service.IsSystemDNSSet(iface) {
+			fmt.Printf("Reverting system DNS on %s to DHCP...\n", iface)
+			_ = network.ResetDNSServers(iface)
+			network.FlushDNSCache()
+		}
+	}
+
+	// 2. Stop and remove background service registration
+	fmt.Printf("Stopping and removing background service...\n")
+	if err := service.Uninstall(); err != nil {
+		fmt.Printf("%sWarning: error during service uninstall: %v%s\n", tester.Yellow, err, tester.Reset)
+	}
+
+	// 3. Clear any active or stale routes
+	if cfg, err := config.Load(); err == nil && cfg != nil {
+		if active := cfg.GetActive(); active != nil && active.Upstream != "" {
+			network.ClearStaleRoutes(active.Upstream)
+		}
+	}
+
+	// 4. Purge configurations, profiles, and logs if requested
+	if purge {
+		fmt.Printf("Purging configuration files, profiles, and logs...\n")
+		var dirsToPurge []string
+		var filesToPurge []string
+
+		if runtime.GOOS == "windows" {
+			if pd := os.Getenv("ProgramData"); pd != "" {
+				dirsToPurge = append(dirsToPurge, filepath.Join(pd, "smartnet"), filepath.Join(pd, "smartdns"))
+			}
+			if ad := os.Getenv("APPDATA"); ad != "" {
+				dirsToPurge = append(dirsToPurge, filepath.Join(ad, "smartnet"), filepath.Join(ad, "smartdns"))
+			}
+			if home, err := os.UserHomeDir(); err == nil {
+				dirsToPurge = append(dirsToPurge,
+					filepath.Join(home, ".config", "smartnet"),
+					filepath.Join(home, ".config", "smartdns"),
+					filepath.Join(home, ".smartnet"),
+					filepath.Join(home, ".smartdns"),
+				)
+			}
+			filesToPurge = append(filesToPurge,
+				filepath.Join(os.TempDir(), "smartnet.log"),
+				filepath.Join(os.TempDir(), "smartdns.log"),
+			)
+		} else {
+			dirsToPurge = append(dirsToPurge, "/etc/smartnet", "/etc/smartdns")
+			if home, err := os.UserHomeDir(); err == nil {
+				dirsToPurge = append(dirsToPurge,
+					filepath.Join(home, ".config", "smartnet"),
+					filepath.Join(home, ".config", "smartdns"),
+					filepath.Join(home, ".smartnet"),
+					filepath.Join(home, ".smartdns"),
+				)
+			}
+			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+				userHome := filepath.Join("/home", sudoUser)
+				if runtime.GOOS == "darwin" {
+					userHome = filepath.Join("/Users", sudoUser)
+				}
+				dirsToPurge = append(dirsToPurge,
+					filepath.Join(userHome, ".config", "smartnet"),
+					filepath.Join(userHome, ".config", "smartdns"),
+					filepath.Join(userHome, ".smartnet"),
+					filepath.Join(userHome, ".smartdns"),
+				)
+			}
+			filesToPurge = append(filesToPurge,
+				"/var/log/smartnet.log",
+				"/var/log/smartdns.log",
+				network.ResolvConfBackup,
+				network.ResolvConfSymlinkBackup,
+			)
+		}
+
+		if cPath := config.GetConfigPath(); cPath != "" {
+			filesToPurge = append(filesToPurge, cPath)
+			dirsToPurge = append(dirsToPurge, filepath.Dir(cPath))
+		}
+		if lPath := config.GetLogPath(); lPath != "" {
+			filesToPurge = append(filesToPurge, lPath)
+		}
+
+		for _, f := range filesToPurge {
+			if _, err := os.Stat(f); err == nil {
+				if err := os.Remove(f); err != nil && runtime.GOOS != "windows" {
+					_, _ = service.RunElevated("rm", "-f", f)
+				}
+			}
+		}
+		for _, d := range dirsToPurge {
+			if _, err := os.Stat(d); err == nil {
+				if err := os.RemoveAll(d); err != nil && runtime.GOOS != "windows" {
+					_, _ = service.RunElevated("rm", "-rf", d)
+				}
+			}
+		}
+		fmt.Printf("%sAll profiles and configuration data have been removed.%s\n", tester.Green, tester.Reset)
+	} else {
+		fmt.Printf("%sConfiguration profiles preserved.%s\n(To delete all profiles and data, use: %ssmartnet uninstall --purge%s)\n",
+			tester.Dim, tester.Reset, tester.Yellow, tester.Reset)
+	}
+
+	// 5. Remove shell auto-completion files
+	completionFiles := []string{
+		"/etc/bash_completion.d/smartnet",
+		"/etc/bash_completion.d/smartdns",
+		"/usr/local/share/zsh/site-functions/_smartnet",
+		"/usr/local/share/zsh/site-functions/_smartdns",
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		completionFiles = append(completionFiles,
+			filepath.Join(home, ".config", "fish", "completions", "smartnet.fish"),
+			filepath.Join(home, ".config", "fish", "completions", "smartdns.fish"),
+			filepath.Join(home, ".zsh", "completion", "_smartnet"),
+			filepath.Join(home, ".zsh", "completion", "_smartdns"),
+		)
+	}
+	for _, cf := range completionFiles {
+		if _, err := os.Stat(cf); err == nil {
+			if err := os.Remove(cf); err != nil && runtime.GOOS != "windows" {
+				_, _ = service.RunElevated("rm", "-f", cf)
+			}
+		}
+	}
+
+	// 6. Remove executable binaries and symlinks
+	fmt.Printf("Removing binary executables and symlinks...\n")
+	execPath, _ := os.Executable()
+	execPath, _ = filepath.EvalSymlinks(execPath)
+
+	if runtime.GOOS == "windows" {
+		execDir := filepath.Dir(execPath)
+
+		// Remove from PATH environment variables
+		psCleanPath := `$p = [System.Environment]::GetEnvironmentVariable('Path', 'Machine'); if ($p -like '*SmartNet*') { [System.Environment]::SetEnvironmentVariable('Path', ($p -split ';' | Where-Object { $_ -notlike '*SmartNet*' } -join ';'), 'Machine') }; $p2 = [System.Environment]::GetEnvironmentVariable('Path', 'User'); if ($p2 -like '*SmartNet*') { [System.Environment]::SetEnvironmentVariable('Path', ($p2 -split ';' | Where-Object { $_ -notlike '*SmartNet*' } -join ';'), 'User') }`
+		cmdPS := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCleanPath)
+		_ = cmdPS.Run()
+
+		delScript := fmt.Sprintf("timeout /t 1 /nobreak >nul & del /f /q \"%s\" 2>nul", execPath)
+		if strings.Contains(strings.ToLower(execDir), "smartnet") {
+			delScript += fmt.Sprintf(" & rmdir /s /q \"%s\" 2>nul", execDir)
+		}
+		cmdDel := exec.Command("cmd.exe", "/c", delScript)
+		_ = cmdDel.Start()
+
+		fmt.Printf("%sSmartNet has been successfully uninstalled from this computer.%s\n", tester.Green, tester.Reset)
+		os.Exit(0)
+	}
+
+	binCandidates := []string{
+		"/usr/local/bin/smartnet",
+		"/usr/local/bin/smartdns",
+		"/opt/homebrew/bin/smartnet",
+		"/opt/homebrew/bin/smartdns",
+	}
+	if execPath != "" {
+		binCandidates = append(binCandidates, execPath)
+	}
+
+	for _, bin := range binCandidates {
+		if _, err := os.Lstat(bin); err == nil {
+			if err := os.Remove(bin); err != nil {
+				_, _ = service.RunElevated("rm", "-f", bin)
+			}
+		}
+	}
+
+	fmt.Printf("%sSmartNet has been completely uninstalled from this computer.%s\n", tester.Green, tester.Reset)
+	os.Exit(0)
 }
 
 func handleCompletion() {

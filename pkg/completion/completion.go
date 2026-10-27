@@ -25,7 +25,7 @@ function __smartnet_domains
     echo "google.com"
 end
 
-set -l commands on off toggle status test list use add remove setup service daemon update completion run env proxy fakeip bypass tun vpn dns version help
+set -l commands on off toggle status test list use add remove setup service daemon update completion run env proxy fakeip bypass tun vpn dns uninstall version help
 
 for cmd in smartnet smartdns
     complete -c $cmd -f
@@ -44,6 +44,7 @@ for cmd in smartnet smartdns
     complete -c $cmd -n "not __fish_seen_subcommand_from $commands" -a service -d "Manage system daemon (launchd/systemd)"
     complete -c $cmd -n "not __fish_seen_subcommand_from $commands" -a daemon -d "Run DNS and proxy server in foreground"
     complete -c $cmd -n "not __fish_seen_subcommand_from $commands" -a update -d "Update SmartNet to latest version"
+    complete -c $cmd -n "not __fish_seen_subcommand_from $commands" -a uninstall -d "Completely remove SmartNet from system"
     complete -c $cmd -n "not __fish_seen_subcommand_from $commands" -a completion -d "Generate shell auto-completion script"
     complete -c $cmd -n "not __fish_seen_subcommand_from $commands" -a run -d "Run command with proxy environment injected"
     complete -c $cmd -n "not __fish_seen_subcommand_from $commands" -a env -d "Output proxy environment exports for shell"
@@ -61,6 +62,7 @@ for cmd in smartnet smartdns
     complete -c $cmd -n "__fish_seen_subcommand_from on" -a "(__smartnet_profiles)" -d "Profile"
     complete -c $cmd -n "__fish_seen_subcommand_from test" -a "(__smartnet_domains)" -d "Domain"
     complete -c $cmd -n "__fish_seen_subcommand_from service" -a "install uninstall start stop restart status"
+    complete -c $cmd -n "__fish_seen_subcommand_from uninstall" -l purge -d "Purge all configuration profiles and data"
     complete -c $cmd -n "__fish_seen_subcommand_from proxy" -a "status run set"
     complete -c $cmd -n "__fish_seen_subcommand_from fakeip" -a "on off status clear"
     complete -c $cmd -n "__fish_seen_subcommand_from bypass" -a "add remove list"
@@ -80,11 +82,15 @@ _smartnet_completions() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="on off toggle status test list use add remove setup service daemon update completion run env proxy fakeip bypass tun vpn dns version help"
+    commands="on off toggle status test list use add remove setup service daemon update uninstall completion run env proxy fakeip bypass tun vpn dns version help"
 
     case "$prev" in
         smartnet|smartdns)
             COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+            return 0
+            ;;
+        uninstall)
+            COMPREPLY=($(compgen -W "--purge --all" -- "$cur"))
             return 0
             ;;
         use|remove|on)
@@ -154,6 +160,7 @@ _smartnet() {
         'service:Manage system daemon (launchd/systemd)'
         'daemon:Run DNS and proxy server in foreground'
         'update:Update SmartNet to latest version'
+        'uninstall:Completely remove SmartNet from system'
         'completion:Generate shell auto-completion script'
         'run:Run command with proxy environment injected'
         'env:Output proxy environment exports for shell'
@@ -205,6 +212,9 @@ _smartnet() {
                 env|completion)
                     _values 'shell' fish zsh bash powershell
                     ;;
+                uninstall)
+                    _values 'flags' --purge --all
+                    ;;
                 test)
                     _values 'domains' cloudaicompanion.googleapis.com chatgpt.com claude.ai gemini.google.com spotify.com canva.com rutracker.org notion.so google.com
                     ;;
@@ -241,6 +251,7 @@ Register-ArgumentCompleter -Native -CommandName smartnet, smartdns -ScriptBlock 
             [System.Management.Automation.CompletionResult]::new('service', 'service', 'ParameterValue', 'Manage system daemon'),
             [System.Management.Automation.CompletionResult]::new('daemon', 'daemon', 'ParameterValue', 'Run DNS and proxy server in foreground'),
             [System.Management.Automation.CompletionResult]::new('update', 'update', 'ParameterValue', 'Update SmartNet to latest version'),
+            [System.Management.Automation.CompletionResult]::new('uninstall', 'uninstall', 'ParameterValue', 'Completely remove SmartNet from system'),
             [System.Management.Automation.CompletionResult]::new('completion', 'completion', 'ParameterValue', 'Generate shell auto-completion script'),
             [System.Management.Automation.CompletionResult]::new('run', 'run', 'ParameterValue', 'Run command with proxy environment injected'),
             [System.Management.Automation.CompletionResult]::new('env', 'env', 'ParameterValue', 'Output proxy environment exports for shell'),
@@ -308,6 +319,12 @@ Register-ArgumentCompleter -Native -CommandName smartnet, smartdns -ScriptBlock 
             $subs = @('on', 'off', 'toggle', 'status')
             $subs | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
                 [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', 'DNS command')
+            }
+        }
+        'uninstall' {
+            $subs = @('--purge', '--all')
+            $subs | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+                [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', 'Purge option')
             }
         }
         { $_ -in 'env', 'completion' } {

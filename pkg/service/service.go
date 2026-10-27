@@ -52,6 +52,11 @@ func runElevated(name string, args ...string) ([]byte, error) {
 	return out, err
 }
 
+// RunElevated runs a command with elevated privileges when needed
+func RunElevated(name string, args ...string) ([]byte, error) {
+	return runElevated(name, args...)
+}
+
 func Install(binPath string) error {
 	absBin, err := filepath.Abs(binPath)
 	if err != nil {
