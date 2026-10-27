@@ -206,4 +206,63 @@ func TestFakeIPResolution(t *testing.T) {
 	}
 }
 
+func TestCacheTTLDecrementAndMinTTL(t *testing.T) {
+	cfg := config.DefaultConfig()
+	s := New(cfg)
+
+	// Create a response with two records: TTL 300 and TTL 60
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeA)
+	msg.Answer = []dns.RR{
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.ParseIP("93.184.216.34"),
+		},
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   net.ParseIP("93.184.216.35"),
+		},
+	}
+
+	cacheKey := "example.com.:1:1"
+	s.cacheResponse(cacheKey, msg, false)
+
+	// Verify that item in cache was stored with min TTL = 60
+	s.cacheMu.RLock()
+	item, found := s.cache[cacheKey]
+	s.cacheMu.RUnlock()
+
+	if !found {
+		t.Fatal("expected item in cache")
+	}
+
+	remaining := time.Until(item.expires)
+	if remaining > 61*time.Second || remaining < 58*time.Second {
+		t.Errorf("expected cache expiry based on min TTL (60s), got %v", remaining)
+	}
+
+	// Manually advance expiry to simulate time elapsed (2s remaining)
+	s.cacheMu.Lock()
+	item.expires = time.Now().Add(2 * time.Second)
+	s.cache[cacheKey] = item
+	s.cacheMu.Unlock()
+
+	// Query via handleDNS (which hits cache)
+	w := &mockDNSWriter{}
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	s.handleDNS(w, req)
+
+	if w.msg == nil || len(w.msg.Answer) == 0 {
+		t.Fatal("expected response from cache")
+	}
+
+	for i, rr := range w.msg.Answer {
+		ttl := rr.Header().Ttl
+		if ttl > 2 {
+			t.Errorf("record %d TTL should be decremented to <= 2, got %d", i, ttl)
+		}
+	}
+}
+
 

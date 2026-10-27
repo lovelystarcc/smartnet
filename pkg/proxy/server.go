@@ -263,6 +263,28 @@ func (s *Server) handleHTTP(conn net.Conn, br *bufio.Reader) {
 		return
 	}
 
+	// Internal control endpoints for daemon management (Fake-IP stats, cache clear, etc.)
+	if strings.HasPrefix(req.URL.Path, "/_smartnet/") {
+		switch req.URL.Path {
+		case "/_smartnet/fakeip/stats":
+			alloc, total := fakeip.DefaultPool.Stats()
+			resp := fmt.Sprintf(`{"allocated":%d,"total":%d}`, alloc, total)
+			_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + strconv.Itoa(len(resp)) + "\r\nConnection: close\r\n\r\n" + resp))
+			_ = conn.Close()
+			return
+		case "/_smartnet/fakeip/clear":
+			fakeip.DefaultPool.Clear()
+			resp := `{"status":"ok"}`
+			_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + strconv.Itoa(len(resp)) + "\r\nConnection: close\r\n\r\n" + resp))
+			_ = conn.Close()
+			return
+		default:
+			_, _ = conn.Write([]byte("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"))
+			_ = conn.Close()
+			return
+		}
+	}
+
 	if req.Method == http.MethodConnect {
 		target := req.Host
 		if !strings.Contains(target, ":") {

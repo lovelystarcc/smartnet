@@ -2,9 +2,13 @@ package fakeip
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -147,4 +151,45 @@ func (p *Pool) Clear() {
 	p.domainToIP = make(map[string]uint32)
 	p.ipToDomain = make(map[uint32]string)
 	p.currentOffset = 0
+}
+
+// QueryDaemonStats queries the running daemon proxy for active Fake-IP pool statistics.
+func QueryDaemonStats(proxyAddr string) (int, int, error) {
+	if proxyAddr == "" {
+		proxyAddr = "127.0.0.1:7890"
+	}
+	client := &http.Client{Timeout: 800 * time.Millisecond}
+	resp, err := client.Get("http://" + proxyAddr + "/_smartnet/fakeip/stats")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("daemon responded with HTTP %d", resp.StatusCode)
+	}
+	var data struct {
+		Allocated int `json:"allocated"`
+		Total     int `json:"total"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return 0, 0, err
+	}
+	return data.Allocated, data.Total, nil
+}
+
+// ClearDaemon sends a request to the running daemon proxy to flush its active Fake-IP mappings.
+func ClearDaemon(proxyAddr string) error {
+	if proxyAddr == "" {
+		proxyAddr = "127.0.0.1:7890"
+	}
+	client := &http.Client{Timeout: 800 * time.Millisecond}
+	resp, err := client.Post("http://"+proxyAddr+"/_smartnet/fakeip/clear", "application/json", nil)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("daemon responded with HTTP %d", resp.StatusCode)
+	}
+	return nil
 }

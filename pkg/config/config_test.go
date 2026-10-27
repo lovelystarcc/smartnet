@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -168,6 +169,16 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if loadedCfg.GetPath() != configPath {
 		t.Errorf("expected path %q, got %q", configPath, loadedCfg.GetPath())
+	}
+
+	if runtime.GOOS != "windows" {
+		fi, err := os.Stat(configPath)
+		if err != nil {
+			t.Fatalf("failed to stat config file: %v", err)
+		}
+		if fi.Mode().Perm() != 0600 {
+			t.Errorf("expected config file permissions 0600, got %o", fi.Mode().Perm())
+		}
 	}
 }
 

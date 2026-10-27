@@ -431,13 +431,30 @@ func (s *Server) cacheResponse(cacheKey string, resp *dns.Msg, isFallback bool) 
 	}
 	ttl := uint32(5)
 	if !isFallback {
-		ttl = resp.Answer[0].Header().Ttl
-		if ttl < 5 {
-			ttl = 5
+		// Minimum TTL across all records in the response
+		minTTL := uint32(3600)
+		for _, rr := range resp.Answer {
+			if h := rr.Header(); h != nil && h.Ttl < minTTL {
+				minTTL = h.Ttl
+			}
 		}
-		if ttl > 3600 {
-			ttl = 3600
+		for _, rr := range resp.Ns {
+			if h := rr.Header(); h != nil && h.Ttl < minTTL {
+				minTTL = h.Ttl
+			}
 		}
+		for _, rr := range resp.Extra {
+			if h := rr.Header(); h != nil && h.Rrtype != dns.TypeOPT && h.Ttl < minTTL {
+				minTTL = h.Ttl
+			}
+		}
+		if minTTL < 5 {
+			minTTL = 5
+		}
+		if minTTL > 3600 {
+			minTTL = 3600
+		}
+		ttl = minTTL
 	}
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
@@ -546,8 +563,28 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 	now := time.Now()
 	if found && now.Before(item.expires) {
+		remainingSec := uint32(time.Until(item.expires).Seconds())
+		if remainingSec < 1 {
+			remainingSec = 1
+		}
 		resp := item.msg.Copy()
 		resp.Id = r.Id
+		// Adjust TTL of all records to reflect remaining cache lifetime
+		for _, rr := range resp.Answer {
+			if h := rr.Header(); h != nil && h.Ttl > remainingSec {
+				h.Ttl = remainingSec
+			}
+		}
+		for _, rr := range resp.Ns {
+			if h := rr.Header(); h != nil && h.Ttl > remainingSec {
+				h.Ttl = remainingSec
+			}
+		}
+		for _, rr := range resp.Extra {
+			if h := rr.Header(); h != nil && h.Rrtype != dns.TypeOPT && h.Ttl > remainingSec {
+				h.Ttl = remainingSec
+			}
+		}
 		_ = w.WriteMsg(resp)
 		return
 	}

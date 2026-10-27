@@ -252,6 +252,14 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config %s: %w", p, err)
 	}
 	cfg.path = p
+
+	// Enforce secure permissions on existing config files containing credentials
+	if runtime.GOOS != "windows" {
+		if fi, statErr := os.Stat(p); statErr == nil && fi.Mode().Perm() != 0600 {
+			_ = os.Chmod(p, 0600)
+		}
+	}
+
 	if cfg.Profiles == nil {
 		cfg.Profiles = make(map[string]*Profile)
 	}
@@ -275,7 +283,9 @@ func (c *Config) Save() error {
 	}
 
 	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	permDir := os.FileMode(0700)
+	permFile := os.FileMode(0600)
+	if err := os.MkdirAll(dir, permDir); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
@@ -284,8 +294,12 @@ func (c *Config) Save() error {
 		return err
 	}
 
-	if err := os.WriteFile(p, data, 0644); err != nil {
+	if err := os.WriteFile(p, data, permFile); err != nil {
 		return err
+	}
+	if runtime.GOOS != "windows" {
+		_ = os.Chmod(p, permFile)
+		_ = os.Chmod(dir, permDir)
 	}
 
 	// On Windows, mirror to ProgramData so background scheduled tasks/services can access it
@@ -293,8 +307,8 @@ func (c *Config) Save() error {
 		if programData := os.Getenv("ProgramData"); programData != "" {
 			pdPath := filepath.Join(programData, "smartnet", "config.json")
 			if !strings.EqualFold(p, pdPath) {
-				_ = os.MkdirAll(filepath.Dir(pdPath), 0755)
-				_ = os.WriteFile(pdPath, data, 0644)
+				_ = os.MkdirAll(filepath.Dir(pdPath), 0700)
+				_ = os.WriteFile(pdPath, data, 0600)
 			}
 		}
 	}

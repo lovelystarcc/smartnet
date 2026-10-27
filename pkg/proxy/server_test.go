@@ -140,3 +140,43 @@ func TestProxyFakeIPTranslation(t *testing.T) {
 		t.Errorf("expected response to contain 'fakeip-ok', got %s", string(respBytes))
 	}
 }
+
+func TestProxyControlEndpoints(t *testing.T) {
+	port := getFreePort(t)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	cfg := config.DefaultConfig()
+	cfg.ProxyAddr = proxyAddr
+
+	srv := New(cfg)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer srv.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Allocate a Fake-IP
+	fakeip.DefaultPool.Allocate("control-test.example.com")
+
+	alloc, total, err := fakeip.QueryDaemonStats(proxyAddr)
+	if err != nil {
+		t.Fatalf("QueryDaemonStats failed: %v", err)
+	}
+	if alloc == 0 || total == 0 {
+		t.Fatalf("expected non-zero allocation stats, got %d / %d", alloc, total)
+	}
+
+	// Clear daemon pool via IPC endpoint
+	if err := fakeip.ClearDaemon(proxyAddr); err != nil {
+		t.Fatalf("ClearDaemon failed: %v", err)
+	}
+
+	allocAfter, _, err := fakeip.QueryDaemonStats(proxyAddr)
+	if err != nil {
+		t.Fatalf("QueryDaemonStats after clear failed: %v", err)
+	}
+	if allocAfter != 0 {
+		t.Fatalf("expected 0 allocations after clear, got %d", allocAfter)
+	}
+}

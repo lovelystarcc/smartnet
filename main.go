@@ -33,7 +33,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-const Version = "2.0.8"
+const Version = "2.0.9"
 
 func printHelp() {
 	fmt.Printf(`%sSmartNet CLI v%s%s — DNS, VLESS-Reality VPN & Transparent TUN Proxy
@@ -251,6 +251,10 @@ func ensureServiceReadyAndSetDNS(iface string) error {
 }
 
 func handleOn() {
+	handleOnWithArgs(os.Args[2:])
+}
+
+func handleOnWithArgs(args []string) {
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Printf("%sFailed to load config: %v%s\n", tester.Red, err, tester.Reset)
@@ -258,18 +262,20 @@ func handleOn() {
 	}
 
 	withVPN := false
-	if len(os.Args) > 2 {
-		for _, arg := range os.Args[2:] {
-			if arg == "--vpn" || arg == "-v" {
-				withVPN = true
-			} else if !strings.HasPrefix(arg, "-") {
-				targetProfile := arg
-				if err := cfg.SetActive(targetProfile); err != nil {
-					fmt.Printf("%s%v%s\n", tester.Red, err, tester.Reset)
-					os.Exit(1)
-				}
+	profileChanged := false
+	for _, arg := range args {
+		if arg == "--vpn" || arg == "-v" {
+			withVPN = true
+		} else if !strings.HasPrefix(arg, "-") && arg != "on" && arg != "toggle" && arg != "dns" {
+			targetProfile := arg
+			if err := cfg.SetActive(targetProfile); err != nil {
+				fmt.Printf("%s%v%s\n", tester.Red, err, tester.Reset)
+				os.Exit(1)
 			}
+			profileChanged = true
 		}
+	}
+	if profileChanged {
 		_ = cfg.Save()
 		_ = service.Restart()
 	}
@@ -351,6 +357,10 @@ func handleOff() {
 }
 
 func handleToggle() {
+	handleToggleWithArgs(os.Args[2:])
+}
+
+func handleToggleWithArgs(args []string) {
 	iface, err := network.ActiveInterface()
 	if err != nil {
 		iface = "Wi-Fi"
@@ -359,7 +369,7 @@ func handleToggle() {
 	if service.IsSystemDNSSet(iface) {
 		handleOff()
 	} else {
-		handleOn()
+		handleOnWithArgs(args)
 	}
 }
 
@@ -447,7 +457,10 @@ func handleStatus() {
 	// 6. Fake-IP Engine
 	fakeIPStr := fmt.Sprintf("%s● Inactive%s (enable with 'smartnet fakeip on')", tester.Yellow, tester.Reset)
 	if active != nil && active.FakeIP {
-		alloc, _ := fakeip.DefaultPool.Stats()
+		alloc, _, err := fakeip.QueryDaemonStats(cfg.ProxyAddr)
+		if err != nil {
+			alloc, _ = fakeip.DefaultPool.Stats()
+		}
 		fakeIPStr = fmt.Sprintf("%s● Active%s (%d IPs allocated in 198.18.0.0/15)", tester.Green, tester.Reset, alloc)
 	}
 	fmt.Printf(" Fake-IP Engine (198.18.0.0/15)  : %s\n", fakeIPStr)
@@ -1363,7 +1376,10 @@ func handleFakeIP() {
 		if active.FakeIP {
 			statusStr = fmt.Sprintf("%sEnabled%s", tester.Green, tester.Reset)
 		}
-		alloc, total := fakeip.DefaultPool.Stats()
+		alloc, total, err := fakeip.QueryDaemonStats(cfg.ProxyAddr)
+		if err != nil {
+			alloc, total = fakeip.DefaultPool.Stats()
+		}
 		fmt.Printf("\n%sFake-IP Engine (RFC 6598 - 198.18.0.0/15)%s\n", tester.Bold, tester.Reset)
 		fmt.Println(tester.Dim + "─────────────────────────────────────────────────────────────────" + tester.Reset)
 		fmt.Printf(" Active Profile     : %s%s%s\n", tester.Cyan, active.Name, tester.Reset)
@@ -1383,18 +1399,25 @@ func handleFakeIP() {
 		fmt.Printf("%sFake-IP mode enabled for profile '%s'. Daemon reloaded.%s\n", tester.Green, active.Name, tester.Reset)
 	case "off", "disable":
 		active.FakeIP = false
+		_ = fakeip.ClearDaemon(cfg.ProxyAddr)
 		fakeip.DefaultPool.Clear()
 		_ = cfg.Save()
 		_ = service.Restart()
 		network.FlushDNSCache()
 		fmt.Printf("%sFake-IP mode disabled for profile '%s'. Daemon reloaded & DNS cache flushed.%s\n", tester.Yellow, active.Name, tester.Reset)
 	case "clear":
+		_ = fakeip.ClearDaemon(cfg.ProxyAddr)
 		fakeip.DefaultPool.Clear()
 		network.FlushDNSCache()
 		fmt.Printf("%sFake-IP pool cleared & DNS cache flushed.%s\n", tester.Green, tester.Reset)
 	case "status":
-		alloc, total := fakeip.DefaultPool.Stats()
-		fmt.Printf("Fake-IP: profile '%s', active: %v, allocated: %d / %d\n", active.Name, active.FakeIP, alloc, total)
+		alloc, total, err := fakeip.QueryDaemonStats(cfg.ProxyAddr)
+		daemonNote := ""
+		if err != nil {
+			alloc, total = fakeip.DefaultPool.Stats()
+			daemonNote = " (daemon unreachable)"
+		}
+		fmt.Printf("Fake-IP: profile '%s', active: %v, allocated: %d / %d%s\n", active.Name, active.FakeIP, alloc, total, daemonNote)
 	default:
 		fmt.Printf("%sUnknown fakeip action: %s%s (use: on, off, status, clear)\n", tester.Red, action, tester.Reset)
 		os.Exit(1)
@@ -1532,13 +1555,17 @@ Usage:
 	}
 
 	sub := strings.ToLower(os.Args[2])
+	var rest []string
+	if len(os.Args) > 3 {
+		rest = os.Args[3:]
+	}
 	switch sub {
 	case "on", "enable":
-		handleOn()
+		handleOnWithArgs(rest)
 	case "off", "disable":
 		handleOff()
 	case "toggle":
-		handleToggle()
+		handleToggleWithArgs(rest)
 	case "status":
 		handleStatus()
 	default:
@@ -1625,6 +1652,14 @@ func handleVPN() {
 		if !noTun {
 			active.TUN = true
 			active.FakeIP = true
+		} else {
+			tunWasActive := active.TUN
+			active.TUN = false
+			active.FakeIP = false
+			if tunWasActive {
+				fakeip.DefaultPool.Clear()
+				network.FlushDNSCache()
+			}
 		}
 
 		_ = cfg.Save()
