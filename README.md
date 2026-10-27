@@ -62,13 +62,13 @@ smartnet on
 smartnet off
 ```
 
-### VLESS-Reality Global VPN Mode
-1-Click anti-censorship VPN combining VLESS-Reality tunnel, Virtual TUN adapter (tun2socks), and zero-latency Fake-IP engine. Routes all system applications transparently through the encrypted tunnel with SNI camouflage.
+### VLESS-Reality VPN Mode (Fake-IP Transparent Proxy)
+1-Click anti-censorship tunnel combining VLESS-Reality transport, a Virtual TUN adapter, and a zero-latency Fake-IP engine (`198.18.0.0/15`). Domain traffic resolved by SmartNet receives synthetic `198.18.x.x` addresses routed transparently into the encrypted tunnel with SNI camouflage. Direct raw IP connections and pre-cached addresses bypass the TUN adapter.
 ```bash
 smartnet vpn set "vless://<uuid>@<host>:443?encryption=none&security=reality&sni=dl.google.com&pbk=<public_key>&sid=<short_id>"
 smartnet vpn on       # 1-Click: enables VLESS + TUN + Fake-IP + System DNS
 smartnet vpn status   # Inspect VPN, TUN, and server status
-smartnet vpn off      # Disables VPN & TUN (keeps SmartDNS intact)
+smartnet vpn off      # Disables VPN & TUN (keeps DNS mode intact)
 smartnet vpn toggle   # Quick toggle on/off
 ```
 
@@ -98,9 +98,9 @@ smartnet fakeip on        # Independent Fake-IP engine control
 ### VPN (VLESS-Reality)
 | Command | Description |
 | :--- | :--- |
-| `smartnet vpn on` | **1-Click Global VPN**: activates VLESS, TUN adapter, Fake-IP & DNS |
-| `smartnet vpn off` | Disable VPN and TUN adapter (reverts to SmartDNS) |
-| `smartnet vpn toggle` | Toggle Global VPN state |
+| `smartnet vpn on` | **1-Click VPN**: activates VLESS, TUN adapter (`198.18.0.0/15`), Fake-IP & DNS |
+| `smartnet vpn off` | Disable VPN and TUN adapter (reverts to DNS mode) |
+| `smartnet vpn toggle` | Toggle VPN state |
 | `smartnet vpn on --no-tun` | Enable VLESS for local proxy bridge only (`127.0.0.1:7890`) |
 | `smartnet vpn set <vless://...>` | Store VLESS-Reality connection string for active profile |
 | `smartnet vpn status` | Show tunnel status and server parameters |

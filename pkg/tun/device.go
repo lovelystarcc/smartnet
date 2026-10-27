@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -68,8 +69,8 @@ func CreateDevice(mtu int) (*Device, error) {
 	}
 
 	if err := d.setupRoutes(); err != nil {
-		log.Printf("[smartnet] Warning: Failed to configure routes for %s: %v", realName, err)
-		// Don't fail hard if route exists or if non-root, keep device open
+		_ = dev.Close()
+		return nil, fmt.Errorf("failed to configure routes for %s: %w", realName, err)
 	}
 
 	return d, nil
@@ -84,25 +85,35 @@ func (d *Device) setupRoutes() error {
 		}
 		// Route 198.18.0.0/15 into utun interface
 		if out, err := runElevated("route", "add", "-net", "198.18.0.0/15", "-interface", d.name); err != nil {
-			return fmt.Errorf("route add failed: %s (%w)", string(out), err)
+			if !strings.Contains(string(out), "File exists") {
+				return fmt.Errorf("route add failed: %s (%w)", string(out), err)
+			}
 		}
 		log.Printf("[smartnet] Configured macOS route: 198.18.0.0/15 -> %s", d.name)
 
 	case "linux":
 		// Assign IP and bring up interface
-		_, _ = runElevated("ip", "addr", "add", "198.18.0.1/15", "dev", d.name)
+		if out, err := runElevated("ip", "addr", "add", "198.18.0.1/15", "dev", d.name); err != nil {
+			if !strings.Contains(string(out), "File exists") {
+				return fmt.Errorf("ip addr add failed: %s (%w)", string(out), err)
+			}
+		}
 		if out, err := runElevated("ip", "link", "set", "dev", d.name, "up"); err != nil {
 			return fmt.Errorf("ip link set up failed: %s (%w)", string(out), err)
 		}
 		// Route 198.18.0.0/15 into smartnet interface
 		if out, err := runElevated("ip", "route", "add", "198.18.0.0/15", "dev", d.name); err != nil {
-			return fmt.Errorf("ip route add failed: %s (%w)", string(out), err)
+			if !strings.Contains(string(out), "File exists") {
+				return fmt.Errorf("ip route add failed: %s (%w)", string(out), err)
+			}
 		}
 		log.Printf("[smartnet] Configured Linux route: 198.18.0.0/15 -> %s", d.name)
 
 	case "windows":
 		// Set static IP on adapter
-		_, _ = runElevated("netsh", "interface", "ipv4", "set", "address", fmt.Sprintf("name=\"%s\"", d.name), "source=static", "addr=198.18.0.1", "mask=255.254.0.0")
+		if out, err := runElevated("netsh", "interface", "ipv4", "set", "address", fmt.Sprintf("name=\"%s\"", d.name), "source=static", "addr=198.18.0.1", "mask=255.254.0.0"); err != nil {
+			return fmt.Errorf("netsh set address failed: %s (%w)", string(out), err)
+		}
 		// Route 198.18.0.0/15
 		if out, err := runElevated("route", "add", "198.18.0.0", "mask", "255.254.0.0", "198.18.0.1", "metric", "1"); err != nil {
 			return fmt.Errorf("route add failed: %s (%w)", string(out), err)

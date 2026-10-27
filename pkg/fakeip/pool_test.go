@@ -15,8 +15,14 @@ func TestPoolAllocationAndLookup(t *testing.T) {
 	if ip1 == nil {
 		t.Fatal("expected non-nil IP")
 	}
+	if ip1.String() != "198.18.0.2" {
+		t.Fatalf("expected first IP to be 198.18.0.2, got %s", ip1)
+	}
 	if !pool.IsFakeIP(ip1) {
 		t.Fatalf("expected %s to be within 198.18.0.0/15", ip1)
+	}
+	if pool.IsFakeIP(net.ParseIP("198.18.0.1")) {
+		t.Fatal("198.18.0.1 should not be considered a Fake-IP (reserved for TUN adapter)")
 	}
 
 	// Repeated allocation returns same IP

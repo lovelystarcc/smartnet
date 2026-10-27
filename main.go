@@ -33,7 +33,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-const Version = "2.0.7"
+const Version = "2.0.8"
 
 func printHelp() {
 	fmt.Printf(`%sSmartNet CLI v%s%s — DNS, VLESS-Reality VPN & Transparent TUN Proxy
@@ -51,7 +51,7 @@ func printHelp() {
   %scompletion%s <sh>  Generate shell completion script (fish, zsh, bash, powershell)
 
 %sVPN & ANTI-CENSORSHIP TUNNEL (VLESS-REALITY):%s
-  %svpn%s [on|off|toggle|status] 1-Click Global VPN (enables VLESS, TUN adapter & Fake-IP)
+  %svpn%s [on|off|toggle|status] Fake-IP TUN Proxy (enables VLESS, TUN adapter & Fake-IP)
   %svpn%s set <vless://...>    Configure VLESS Reality server URI for active profile
 
 %sADVANCED ADAPTER & ENGINE CONTROLS:%s
@@ -215,6 +215,41 @@ func main() {
 	}
 }
 
+// ensureServiceReadyAndSetDNS verifies that the background service is running and
+// listening on 127.0.0.1:53 before setting system DNS. If the daemon fails to listen,
+// it ensures system DNS is reverted to DHCP and returns an error.
+func ensureServiceReadyAndSetDNS(iface string) error {
+	if !service.IsListening() {
+		running, _, _ := service.Status()
+		if running {
+			_ = service.Restart()
+		} else {
+			_ = service.Start()
+		}
+
+		ready := false
+		for i := 0; i < 30; i++ {
+			time.Sleep(100 * time.Millisecond)
+			if service.IsListening() {
+				ready = true
+				break
+			}
+		}
+
+		if !ready {
+			_ = network.ResetDNSServers(iface)
+			return fmt.Errorf("SmartNet daemon failed to bind port 53 or is not responding; DNS was reverted")
+		}
+	}
+
+	if err := network.SetDNSServers(iface, "127.0.0.1"); err != nil {
+		_ = network.ResetDNSServers(iface)
+		return fmt.Errorf("failed to configure system DNS on %s: %w", iface, err)
+	}
+	network.FlushDNSCache()
+	return nil
+}
+
 func handleOn() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -259,43 +294,16 @@ func handleOn() {
 			_ = cfg.Save()
 			_ = service.Restart()
 		} else {
-			fmt.Printf("%s⚠️ No VLESS configuration found for profile '%s'. Skipping VPN activation.%s\n", tester.Yellow, active.Name, tester.Reset)
+			fmt.Printf("%sNo VLESS configuration found for profile '%s'. Skipping VPN activation.%s\n", tester.Yellow, active.Name, tester.Reset)
 		}
 	}
 
-	// Ensure background service is running and listening on port 53
-	if !service.IsListening() {
-		running, pid, _ := service.Status()
-		if running {
-			fmt.Printf("%s⚠️ Stale process detected (PID: %d) but port 53 is not responding. Restarting daemon...%s\n", tester.Yellow, pid, tester.Reset)
-			_ = service.Restart()
-		} else {
-			_ = service.Start()
-		}
-
-		// Wait up to 3 seconds for port 53 to become ready
-		ready := false
-		for i := 0; i < 30; i++ {
-			time.Sleep(100 * time.Millisecond)
-			if service.IsListening() {
-				ready = true
-				break
-			}
-		}
-
-		if !ready {
-			fmt.Printf("%s❌ Error: SmartNet daemon failed to bind port 53 or is not responding.%s\n", tester.Red, tester.Reset)
-			fmt.Printf("%s🛡️ Safety Watchdog: System DNS was NOT changed to protect your internet connection.%s\n", tester.Yellow, tester.Reset)
-			fmt.Printf("Run '%ssmartnet log%s' to inspect daemon startup logs, or run '%ssmartnet daemon%s' in a console.\n", tester.Bold, tester.Reset, tester.Bold, tester.Reset)
-			os.Exit(1)
-		}
-	}
-
-	if err := network.SetDNSServers(iface, "127.0.0.1"); err != nil {
-		fmt.Printf("%sFailed to enable DNS: %v%s\n", tester.Red, err, tester.Reset)
+	if err := ensureServiceReadyAndSetDNS(iface); err != nil {
+		fmt.Printf("%sError: %v%s\n", tester.Red, err, tester.Reset)
+		fmt.Printf("Safety Watchdog: System DNS was not modified or was reverted.\n")
+		fmt.Printf("Run '%ssmartnet log%s' to inspect daemon startup logs, or run '%ssmartnet daemon%s' in a console.\n", tester.Bold, tester.Reset, tester.Bold, tester.Reset)
 		os.Exit(1)
 	}
-	network.FlushDNSCache()
 
 	profileName := cfg.ActiveProfile
 	vpnSuffix := ""
@@ -586,7 +594,7 @@ func handleUse() {
 	}
 
 	_ = service.Restart()
-	fmt.Printf("%s✓ Active profile switched to '%s'%s (%s)\n",
+	fmt.Printf("%sActive profile switched to '%s'%s (%s)\n",
 		tester.Green, name, tester.Reset, cfg.GetActive().Upstream)
 }
 
@@ -641,7 +649,7 @@ Examples:
 		os.Exit(1)
 	}
 
-	fmt.Printf("%s✓ Profile '%s' added successfully!%s\n", tester.Green, name, tester.Reset)
+	fmt.Printf("%sProfile '%s' added successfully!%s\n", tester.Green, name, tester.Reset)
 }
 
 func handleRemove() {
@@ -667,7 +675,7 @@ func handleRemove() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("%s✓ Profile '%s' removed.%s\n", tester.Green, name, tester.Reset)
+	fmt.Printf("%sProfile '%s' removed.%s\n", tester.Green, name, tester.Reset)
 }
 
 func handleSetup() {
@@ -713,14 +721,18 @@ Example:
 		fmt.Println(" [2/4] System service installed and started")
 	}
 
-	// Turn on DNS
-	iface, _ := network.ActiveInterface()
+	// Turn on DNS only after verifying daemon is listening
+	iface, err := network.ActiveInterface()
+	if err != nil {
+		iface = "Wi-Fi"
+	}
 	_ = network.EnsureRouteBypass(upstream)
-	if err := network.SetDNSServers(iface, "127.0.0.1"); err != nil {
-		fmt.Printf("%s [!] Failed to enable system DNS: %v%s\n", tester.Red, err, tester.Reset)
+	if err := ensureServiceReadyAndSetDNS(iface); err != nil {
+		fmt.Printf("%s [!] Failed to activate DNS: %v%s\n", tester.Red, err, tester.Reset)
+		fmt.Printf(" Service did not become ready. System DNS was not modified.\n")
+		fmt.Printf(" Run '%ssmartnet daemon%s' to diagnose startup errors.\n", tester.Bold, tester.Reset)
 	} else {
-		network.FlushDNSCache()
-		fmt.Printf(" [3/4] DNS enabled on interface %s (127.0.0.1)\n", iface)
+		fmt.Printf(" [3/4] DNS verified and enabled on interface %s (127.0.0.1)\n", iface)
 	}
 
 	time.Sleep(500 * time.Millisecond)
@@ -757,35 +769,35 @@ func handleService() {
 			fmt.Printf("%sError: %v%s\n", tester.Red, err, tester.Reset)
 			os.Exit(1)
 		}
-		fmt.Printf("%s✓ Service successfully installed and started!%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sService successfully installed and started!%s\n", tester.Green, tester.Reset)
 
 	case "uninstall":
 		if err := service.Uninstall(); err != nil {
 			fmt.Printf("%sError: %v%s\n", tester.Red, err, tester.Reset)
 			os.Exit(1)
 		}
-		fmt.Printf("%s✓ Service removed from system.%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sService removed from system.%s\n", tester.Green, tester.Reset)
 
 	case "start":
 		if err := service.Start(); err != nil {
 			fmt.Printf("%sError: %v%s\n", tester.Red, err, tester.Reset)
 			os.Exit(1)
 		}
-		fmt.Printf("%s✓ Service started.%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sService started.%s\n", tester.Green, tester.Reset)
 
 	case "stop":
 		if err := service.Stop(); err != nil {
 			fmt.Printf("%sError: %v%s\n", tester.Red, err, tester.Reset)
 			os.Exit(1)
 		}
-		fmt.Printf("%s✓ Service stopped.%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sService stopped.%s\n", tester.Green, tester.Reset)
 
 	case "restart":
 		if err := service.Restart(); err != nil {
 			fmt.Printf("%sError: %v%s\n", tester.Red, err, tester.Reset)
 			os.Exit(1)
 		}
-		fmt.Printf("%s✓ Service restarted.%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sService restarted.%s\n", tester.Green, tester.Reset)
 
 	case "status":
 		running, pid, _ := service.Status()
@@ -830,8 +842,31 @@ func handleDaemon() {
 
 	log.Printf("[smartnet] Starting server (profile: %s, upstream: %s)", active.Name, active.Upstream)
 
+	var tunStack *tun.Stack
+	if active.TUN {
+		ts, err := tun.NewStack(cfg)
+		if err != nil {
+			log.Printf("[smartnet] Error: Failed to create TUN adapter: %v. Disabling Fake-IP to prevent traffic blackholing.", err)
+			active.FakeIP = false
+			active.TUN = false
+		} else if err := ts.Start(); err != nil {
+			log.Printf("[smartnet] Error: Failed to start TUN stack: %v. Disabling Fake-IP to prevent traffic blackholing.", err)
+			active.FakeIP = false
+			active.TUN = false
+		} else {
+			tunStack = ts
+			log.Printf("[smartnet] TUN adapter '%s' active (198.18.0.0/15 -> userspace netstack)", tunStack.DeviceName())
+		}
+	} else if active.FakeIP {
+		log.Printf("[smartnet] Warning: FakeIP is enabled without TUN adapter; disabling FakeIP to prevent traffic blackholing.")
+		active.FakeIP = false
+	}
+
 	srv := resolver.New(cfg)
 	if err := srv.Start(); err != nil {
+		if tunStack != nil {
+			tunStack.Stop()
+		}
 		log.Printf("[smartnet] Failed to start DNS server: %v", err)
 		iface, errNet := network.ActiveInterface()
 		if errNet == nil && service.IsSystemDNSSet(iface) {
@@ -844,19 +879,6 @@ func handleDaemon() {
 	proxySrv := proxy.New(cfg)
 	if err := proxySrv.Start(); err != nil {
 		log.Printf("[smartnet] Warning: Failed to start proxy bridge: %v", err)
-	}
-
-	var tunStack *tun.Stack
-	if active.TUN {
-		ts, err := tun.NewStack(cfg)
-		if err != nil {
-			log.Printf("[smartnet] Warning: Failed to create TUN adapter: %v", err)
-		} else if err := ts.Start(); err != nil {
-			log.Printf("[smartnet] Warning: Failed to start TUN stack: %v", err)
-		} else {
-			tunStack = ts
-			log.Printf("[smartnet] TUN adapter '%s' active (198.18.0.0/15 -> userspace netstack)", tunStack.DeviceName())
-		}
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -875,19 +897,29 @@ func handleDaemon() {
 					tunStack = nil
 				}
 
+				newActive := cfg.GetActive()
+				if newActive != nil && newActive.TUN {
+					ts, err := tun.NewStack(cfg)
+					if err != nil {
+						log.Printf("[smartnet] Error: Failed to create TUN adapter on reload: %v. Disabling Fake-IP to prevent traffic blackholing.", err)
+						newActive.FakeIP = false
+						newActive.TUN = false
+					} else if err := ts.Start(); err != nil {
+						log.Printf("[smartnet] Error: Failed to start TUN stack on reload: %v. Disabling Fake-IP to prevent traffic blackholing.", err)
+						newActive.FakeIP = false
+						newActive.TUN = false
+					} else {
+						tunStack = ts
+						log.Printf("[smartnet] TUN adapter '%s' reloaded", tunStack.DeviceName())
+					}
+				} else if newActive != nil && newActive.FakeIP {
+					newActive.FakeIP = false
+				}
+
 				srv = resolver.New(cfg)
 				proxySrv = proxy.New(cfg)
 				_ = srv.Start()
 				_ = proxySrv.Start()
-
-				newActive := cfg.GetActive()
-				if newActive != nil && newActive.TUN {
-					ts, err := tun.NewStack(cfg)
-					if err == nil && ts.Start() == nil {
-						tunStack = ts
-						log.Printf("[smartnet] TUN adapter '%s' reloaded", tunStack.DeviceName())
-					}
-				}
 			}
 			continue
 		}
@@ -930,7 +962,7 @@ func handleLog() {
 			fmt.Printf("%sFailed to clear log file %s: %v%s\n", tester.Red, logPath, err, tester.Reset)
 			os.Exit(1)
 		}
-		fmt.Printf("%s✓ Log file cleared: %s%s\n", tester.Green, logPath, tester.Reset)
+		fmt.Printf("%sLog file cleared: %s%s\n", tester.Green, logPath, tester.Reset)
 		return
 	}
 
@@ -1151,7 +1183,7 @@ func handleProxy() {
 		active.ProxyUpstream = os.Args[3]
 		_ = cfg.Save()
 		_ = service.Restart()
-		fmt.Printf("%s✓ Active profile '%s' proxy upstream set to %s%s\n", tester.Green, active.Name, os.Args[3], tester.Reset)
+		fmt.Printf("%sActive profile '%s' proxy upstream set to %s%s\n", tester.Green, active.Name, os.Args[3], tester.Reset)
 	default:
 		fmt.Printf("%sUnknown proxy action: %s%s\n", tester.Red, action, tester.Reset)
 		os.Exit(1)
@@ -1269,14 +1301,14 @@ func handleUpdate() {
 		}
 	}
 
-	fmt.Printf("%s✓ Updated successfully at %s%s\n", tester.Green, execPath, tester.Reset)
+	fmt.Printf("%sUpdated successfully at %s%s\n", tester.Green, execPath, tester.Reset)
 
 	// Check if background service is running and restart it
 	running, _, _ := service.Status()
 	if running {
 		fmt.Printf("Restarting background daemon...\n")
 		_ = service.Restart()
-		fmt.Printf("%s✓ Service reloaded with the new version.%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sService reloaded with the new version.%s\n", tester.Green, tester.Reset)
 	}
 }
 
@@ -1348,18 +1380,18 @@ func handleFakeIP() {
 		active.FakeIP = true
 		_ = cfg.Save()
 		_ = service.Restart()
-		fmt.Printf("%s✓ Fake-IP mode enabled for profile '%s'. Daemon reloaded.%s\n", tester.Green, active.Name, tester.Reset)
+		fmt.Printf("%sFake-IP mode enabled for profile '%s'. Daemon reloaded.%s\n", tester.Green, active.Name, tester.Reset)
 	case "off", "disable":
 		active.FakeIP = false
 		fakeip.DefaultPool.Clear()
 		_ = cfg.Save()
 		_ = service.Restart()
 		network.FlushDNSCache()
-		fmt.Printf("%s✓ Fake-IP mode disabled for profile '%s'. Daemon reloaded & DNS cache flushed.%s\n", tester.Yellow, active.Name, tester.Reset)
+		fmt.Printf("%sFake-IP mode disabled for profile '%s'. Daemon reloaded & DNS cache flushed.%s\n", tester.Yellow, active.Name, tester.Reset)
 	case "clear":
 		fakeip.DefaultPool.Clear()
 		network.FlushDNSCache()
-		fmt.Printf("%s✓ Fake-IP pool cleared & DNS cache flushed.%s\n", tester.Green, tester.Reset)
+		fmt.Printf("%sFake-IP pool cleared & DNS cache flushed.%s\n", tester.Green, tester.Reset)
 	case "status":
 		alloc, total := fakeip.DefaultPool.Stats()
 		fmt.Printf("Fake-IP: profile '%s', active: %v, allocated: %d / %d\n", active.Name, active.FakeIP, alloc, total)
@@ -1411,7 +1443,7 @@ func handleBypass() {
 		_ = cfg.AddBypassDomain(active.Name, domain)
 		_ = cfg.Save()
 		_ = service.Restart()
-		fmt.Printf("%s✓ Added '%s' to bypass list for profile '%s'. Daemon reloaded.%s\n", tester.Green, domain, active.Name, tester.Reset)
+		fmt.Printf("%sAdded '%s' to bypass list for profile '%s'. Daemon reloaded.%s\n", tester.Green, domain, active.Name, tester.Reset)
 	case "remove", "rm", "delete":
 		if len(os.Args) < 4 {
 			fmt.Printf("%sUsage: smartnet bypass remove <domain>%s\n", tester.Yellow, tester.Reset)
@@ -1421,7 +1453,7 @@ func handleBypass() {
 		_ = cfg.RemoveBypassDomain(active.Name, domain)
 		_ = cfg.Save()
 		_ = service.Restart()
-		fmt.Printf("%s✓ Removed '%s' from bypass list for profile '%s'. Daemon reloaded.%s\n", tester.Green, domain, active.Name, tester.Reset)
+		fmt.Printf("%sRemoved '%s' from bypass list for profile '%s'. Daemon reloaded.%s\n", tester.Green, domain, active.Name, tester.Reset)
 	default:
 		fmt.Printf("%sUnknown bypass action: %s%s (use: add, remove, list)\n", tester.Red, action, tester.Reset)
 		os.Exit(1)
@@ -1446,13 +1478,13 @@ func handleTUN() {
 		if active.TUN {
 			statusStr = fmt.Sprintf("%sEnabled%s", tester.Green, tester.Reset)
 		}
-		fmt.Printf("\n%sVirtual TUN Adapter (Global Transparent Proxy)%s\n", tester.Bold, tester.Reset)
+		fmt.Printf("\n%sVirtual TUN Adapter (Fake-IP Transparent Proxy)%s\n", tester.Bold, tester.Reset)
 		fmt.Println(tester.Dim + "─────────────────────────────────────────────────────────────────" + tester.Reset)
 		fmt.Printf(" Active Profile     : %s%s%s\n", tester.Cyan, active.Name, tester.Reset)
 		fmt.Printf(" State              : %s\n", statusStr)
 		fmt.Printf(" Subnet Routing     : 198.18.0.0/15 (Fake-IP tun2socks)\n")
 		fmt.Println(tester.Dim + "─────────────────────────────────────────────────────────────────" + tester.Reset)
-		fmt.Printf("Usage:\n  smartnet tun on      - Enable Global TUN mode (transparent proxy for all apps)\n  smartnet tun off     - Disable Global TUN mode\n  smartnet tun status  - Show TUN adapter status\n\n")
+		fmt.Printf("Usage:\n  smartnet tun on      - Enable Fake-IP TUN mode (routes 198.18.0.0/15 via TUN)\n  smartnet tun off     - Disable TUN mode\n  smartnet tun status  - Show TUN adapter status\n\n")
 		return
 	}
 
@@ -1463,8 +1495,9 @@ func handleTUN() {
 		active.FakeIP = true // TUN requires Fake-IP to route domains into 198.18.0.0/15
 		_ = cfg.Save()
 		_ = service.Restart()
-		fmt.Printf("%s✓ TUN mode enabled for profile '%s'. Fake-IP enabled. Daemon reloaded.%s\n", tester.Green, active.Name, tester.Reset)
-		fmt.Println("  All system applications now route through SmartNet transparently without proxy settings.")
+		network.FlushDNSCache()
+		fmt.Printf("%sTUN mode enabled for profile '%s'. Fake-IP enabled. Daemon reloaded.%s\n", tester.Green, active.Name, tester.Reset)
+		fmt.Println("  Domain traffic resolves into 198.18.0.0/15 and routes via TUN transparently. Direct IP connections bypass the tunnel.")
 	case "off", "disable":
 		active.TUN = false
 		active.FakeIP = false
@@ -1472,7 +1505,7 @@ func handleTUN() {
 		_ = cfg.Save()
 		_ = service.Restart()
 		network.FlushDNSCache()
-		fmt.Printf("%s✓ TUN mode disabled for profile '%s'. Fake-IP cleared & daemon reloaded.%s\n", tester.Yellow, active.Name, tester.Reset)
+		fmt.Printf("%sTUN mode disabled for profile '%s'. Fake-IP cleared & daemon reloaded.%s\n", tester.Yellow, active.Name, tester.Reset)
 	case "status":
 		statusStr := "disabled"
 		if active.TUN {
@@ -1561,9 +1594,9 @@ func handleVPN() {
 		}
 		fmt.Println(tester.Dim + "─────────────────────────────────────────────────────────────────" + tester.Reset)
 		fmt.Printf("Usage:\n")
-		fmt.Printf("  smartnet vpn on                 - Enable Global VPN (VLESS + TUN + Fake-IP in 1 click)\n")
-		fmt.Printf("  smartnet vpn off                - Disable Global VPN and TUN adapter\n")
-		fmt.Printf("  smartnet vpn toggle             - Toggle Global VPN on/off\n")
+		fmt.Printf("  smartnet vpn on                 - Enable VPN (VLESS + TUN + Fake-IP in 1 click)\n")
+		fmt.Printf("  smartnet vpn off                - Disable VPN and TUN adapter\n")
+		fmt.Printf("  smartnet vpn toggle             - Toggle VPN on/off\n")
 		fmt.Printf("  smartnet vpn set <vless://...>  - Configure VLESS Reality server URI\n")
 		fmt.Printf("  smartnet vpn status             - Show current VPN tunnel status\n\n")
 		fmt.Printf("Advanced (Granular Controls):\n")
@@ -1577,7 +1610,7 @@ func handleVPN() {
 	switch action {
 	case "on", "enable":
 		if active.VLESS == nil {
-			fmt.Printf("%s⚠️ No VLESS configuration found for profile '%s'.%s\nConfigure it first:\n  smartnet vpn set vless://uuid@server:port?security=reality&sni=...&pbk=...\n", tester.Yellow, active.Name, tester.Reset)
+			fmt.Printf("%sNo VLESS configuration found for profile '%s'.%s\nConfigure it first:\n  smartnet vpn set vless://uuid@server:port?security=reality&sni=...&pbk=...\n", tester.Yellow, active.Name, tester.Reset)
 			os.Exit(1)
 		}
 
@@ -1592,31 +1625,35 @@ func handleVPN() {
 		if !noTun {
 			active.TUN = true
 			active.FakeIP = true
+		}
 
+		_ = cfg.Save()
+		_ = service.Restart()
+
+		if !noTun {
 			iface, err := network.ActiveInterface()
 			if err != nil {
 				iface = "Wi-Fi"
 			}
 			_ = network.EnsureRouteBypass(active.Upstream)
-			_ = network.SetDNSServers(iface, "127.0.0.1")
-		}
-
-		_ = cfg.Save()
-
-		if !service.IsListening() {
-			running, _, _ := service.Status()
-			if !running {
-				_ = service.Start()
+			if err := ensureServiceReadyAndSetDNS(iface); err != nil {
+				fmt.Printf("%sError activating VPN: %v%s\n", tester.Red, err, tester.Reset)
+				active.VPN = false
+				active.TUN = false
+				active.FakeIP = false
+				_ = cfg.Save()
+				_ = network.ResetDNSServers(iface)
+				os.Exit(1)
 			}
 		}
-		_ = service.Restart()
 
-		fmt.Printf("%s✓ VLESS-Reality VPN enabled for profile '%s'.%s\n", tester.Green, active.Name, tester.Reset)
+		fmt.Printf("%sVLESS-Reality VPN enabled for profile '%s'.%s\n", tester.Green, active.Name, tester.Reset)
 		if !noTun {
-			fmt.Printf("  • Mode        : %sGlobal Transparent VPN%s (all system applications routed via TUN)\n", tester.Bold, tester.Reset)
+			fmt.Printf("  • Mode        : %sFake-IP Transparent Proxy%s (198.18.0.0/15, domain traffic routed via TUN)\n", tester.Bold, tester.Reset)
 			fmt.Printf("  • Server      : %s:%d (SNI: %s)\n", active.VLESS.Server, active.VLESS.Port, active.VLESS.ServerName)
-			fmt.Printf("  • Adapter     : Virtual TUN (utun) + Fake-IP (RFC 6598)\n")
+			fmt.Printf("  • Adapter     : Virtual TUN + Fake-IP (198.18.0.0/15)\n")
 			fmt.Printf("  • System DNS  : 127.0.0.1 (active)\n")
+			fmt.Printf("  • Note        : Raw IP connections and pre-cached IPs bypass TUN proxy\n")
 		} else {
 			fmt.Printf("  • Mode        : %sProxy Backend Only%s (127.0.0.1:7890, TUN disabled)\n", tester.Cyan, tester.Reset)
 			fmt.Printf("  • Server      : %s:%d (SNI: %s)\n", active.VLESS.Server, active.VLESS.Port, active.VLESS.ServerName)
@@ -1631,7 +1668,7 @@ func handleVPN() {
 		_ = cfg.Save()
 		_ = service.Restart()
 		network.FlushDNSCache()
-		fmt.Printf("%s✓ VLESS-Reality VPN disabled for profile '%s'.%s\n", tester.Yellow, active.Name, tester.Reset)
+		fmt.Printf("%sVLESS-Reality VPN disabled for profile '%s'.%s\n", tester.Yellow, active.Name, tester.Reset)
 		if tunWasActive {
 			fmt.Printf("  • TUN transparent proxy adapter disabled.\n")
 		}
@@ -1648,39 +1685,40 @@ func handleVPN() {
 			_ = cfg.Save()
 			_ = service.Restart()
 			network.FlushDNSCache()
-			fmt.Printf("%s✓ VLESS-Reality VPN disabled for profile '%s'.%s\n", tester.Yellow, active.Name, tester.Reset)
+			fmt.Printf("%sVLESS-Reality VPN disabled for profile '%s'.%s\n", tester.Yellow, active.Name, tester.Reset)
 			if tunWasActive {
 				fmt.Printf("  • TUN transparent proxy adapter disabled.\n")
 			}
 			fmt.Printf("  • Fake-IP disabled, pool cleared & DNS cache flushed.\n")
 		} else {
 			if active.VLESS == nil {
-				fmt.Printf("%s⚠️ No VLESS configuration found for profile '%s'.%s\nConfigure it first:\n  smartnet vpn set vless://...\n", tester.Yellow, active.Name, tester.Reset)
+				fmt.Printf("%sNo VLESS configuration found for profile '%s'.%s\nConfigure it first:\n  smartnet vpn set vless://...\n", tester.Yellow, active.Name, tester.Reset)
 				os.Exit(1)
 			}
 			active.VPN = true
 			active.TUN = true
 			active.FakeIP = true
 
+			_ = cfg.Save()
+			_ = service.Restart()
+
 			iface, err := network.ActiveInterface()
 			if err != nil {
 				iface = "Wi-Fi"
 			}
 			_ = network.EnsureRouteBypass(active.Upstream)
-			_ = network.SetDNSServers(iface, "127.0.0.1")
-
-			_ = cfg.Save()
-
-			if !service.IsListening() {
-				running, _, _ := service.Status()
-				if !running {
-					_ = service.Start()
-				}
+			if err := ensureServiceReadyAndSetDNS(iface); err != nil {
+				fmt.Printf("%sError activating VPN: %v%s\n", tester.Red, err, tester.Reset)
+				active.VPN = false
+				active.TUN = false
+				active.FakeIP = false
+				_ = cfg.Save()
+				_ = network.ResetDNSServers(iface)
+				os.Exit(1)
 			}
-			_ = service.Restart()
 
-			fmt.Printf("%s✓ VLESS-Reality VPN enabled for profile '%s'.%s\n", tester.Green, active.Name, tester.Reset)
-			fmt.Printf("  • Mode   : Global Transparent VPN (all system applications routed via TUN)\n")
+			fmt.Printf("%sVLESS-Reality VPN enabled for profile '%s'.%s\n", tester.Green, active.Name, tester.Reset)
+			fmt.Printf("  • Mode   : Fake-IP Transparent Proxy (198.18.0.0/15, domain traffic routed via TUN)\n")
 			fmt.Printf("  • Server : %s:%d (SNI: %s)\n", active.VLESS.Server, active.VLESS.Port, active.VLESS.ServerName)
 		}
 
@@ -1698,7 +1736,7 @@ func handleVPN() {
 		active.VLESS = vlessCfg
 		_ = cfg.Save()
 		_ = service.Restart()
-		fmt.Printf("%s✓ VLESS Reality configured for profile '%s':%s\n", tester.Green, active.Name, tester.Reset)
+		fmt.Printf("%sVLESS Reality configured for profile '%s':%s\n", tester.Green, active.Name, tester.Reset)
 		fmt.Printf("  Server     : %s:%d\n", vlessCfg.Server, vlessCfg.Port)
 		fmt.Printf("  Camouflage : %s\n", vlessCfg.ServerName)
 		if vlessCfg.Flow != "" {

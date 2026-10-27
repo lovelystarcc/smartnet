@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	// RFC 2544 / RFC 6598 Benchmark testing range commonly used for Fake-IP
-	fakeIPStartUint = uint32(0xC6120001) // 198.18.0.1
+	// RFC 2544 / RFC 6598 Benchmark testing range commonly used for Fake-IP.
+	// 198.18.0.1 is reserved as the TUN adapter interface IP, so the pool starts at 198.18.0.2.
+	fakeIPStartUint = uint32(0xC6120002) // 198.18.0.2
 	fakeIPEndUint   = uint32(0xC613FFFE) // 198.19.255.254
 	fakeIPPoolSize  = fakeIPEndUint - fakeIPStartUint + 1
 )
@@ -54,12 +55,19 @@ func cleanDomain(domain string) string {
 	return strings.ToLower(strings.TrimSuffix(domain, "."))
 }
 
-// IsFakeIP checks if the given IP belongs to the 198.18.0.0/15 Fake-IP range
+// IsFakeIP checks if the given IP belongs to the 198.18.0.0/15 Fake-IP range (excluding the adapter IP 198.18.0.1)
 func (p *Pool) IsFakeIP(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
-	return fakeIPNet.Contains(ip)
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	if v4[0] == 198 && v4[1] == 18 && v4[2] == 0 && v4[3] == 1 {
+		return false // Reserved adapter interface IP
+	}
+	return fakeIPNet.Contains(v4)
 }
 
 // Allocate assigns or retrieves a Fake-IP for the given domain

@@ -1,13 +1,16 @@
 package vless
 
 import (
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"io"
 	"math/big"
 	"net"
 	"strconv"
@@ -18,7 +21,7 @@ import (
 )
 
 func TestParseURL(t *testing.T) {
-	raw := "vless://a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d@vpn.example.com:8443?encryption=none&security=reality&sni=gateway.icloud.com&pbk=fakePubkey123&sid=1234abcd&flow=xtls-rprx-vision#Germany"
+	raw := "vless://a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d@vpn.example.com:8443?encryption=none&security=reality&sni=gateway.icloud.com&pbk=fakePubkey123&sid=1234abcd#Germany"
 	cfg, err := ParseURL(raw)
 	if err != nil {
 		t.Fatalf("ParseURL failed: %v", err)
@@ -41,6 +44,12 @@ func TestParseURL(t *testing.T) {
 	}
 	if cfg.ShortID != "1234abcd" {
 		t.Errorf("Expected sid 1234abcd, got %s", cfg.ShortID)
+	}
+
+	// Unsupported flow should be explicitly rejected
+	visionURL := "vless://a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d@vpn.example.com:8443?security=reality&sni=gateway.icloud.com&pbk=fakePubkey123&flow=xtls-rprx-vision"
+	if _, err := ParseURL(visionURL); err == nil {
+		t.Error("Expected error for unsupported flow xtls-rprx-vision")
 	}
 
 	// Invalid URLs
@@ -129,10 +138,56 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	}, nil
 }
 
+func TestTLSRejectsUntrustedServer(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("Failed to generate test certificate: %v", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsConfig)
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	portNum, _ := strconv.Atoi(portStr)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	vlessCfg := &config.VLESSConfig{
+		Server:     "127.0.0.1",
+		Port:       portNum,
+		UUID:       "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+		ServerName: "127.0.0.1",
+	}
+
+	// Default dialer without custom RootCAs must reject untrusted self-signed certificate
+	dialer := NewDialer(vlessCfg)
+	_, err = dialer.Dial("tcp", "target-domain.com:443")
+	if err == nil {
+		t.Fatal("Expected dial to fail certificate verification against untrusted server, but it succeeded")
+	}
+}
+
 func TestVLESSDialerEndToEnd(t *testing.T) {
 	cert, err := generateSelfSignedCert()
 	if err != nil {
 		t.Fatalf("Failed to generate test certificate: %v", err)
+	}
+
+	parsedCert, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("Failed to parse test certificate: %v", err)
 	}
 
 	tlsConfig := &tls.Config{
@@ -184,6 +239,10 @@ func TestVLESSDialerEndToEnd(t *testing.T) {
 	}
 
 	dialer := NewDialer(vlessCfg)
+	certPool := x509.NewCertPool()
+	certPool.AddCert(parsedCert)
+	dialer.rootCAs = certPool
+
 	clientConn, err := dialer.Dial("tcp", "target-domain.com:443")
 	if err != nil {
 		t.Fatalf("Dialer.Dial failed: %v", err)
@@ -204,5 +263,105 @@ func TestVLESSDialerEndToEnd(t *testing.T) {
 
 	if string(readBuf[:n]) != "vless-echo:ping" {
 		t.Errorf("Expected vless-echo:ping, got %s", string(readBuf[:n]))
+	}
+}
+
+func TestVLESSUDPFraming(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	vConn := &vlessConn{
+		Conn:  clientConn,
+		isUDP: true,
+	}
+
+	go func() {
+		// Server reads 2-byte datagram length prefix + payload
+		lenBuf := make([]byte, 2)
+		if _, err := io.ReadFull(serverConn, lenBuf); err != nil {
+			return
+		}
+		pktLen := binary.BigEndian.Uint16(lenBuf)
+		if pktLen != 4 {
+			t.Errorf("Expected UDP length 4, got %d", pktLen)
+			return
+		}
+		payload := make([]byte, pktLen)
+		if _, err := io.ReadFull(serverConn, payload); err != nil {
+			return
+		}
+		if string(payload) != "ping" {
+			t.Errorf("Expected ping, got %s", string(payload))
+			return
+		}
+
+		// Server writes VLESS response header (version 0, addon 0)
+		_, _ = serverConn.Write([]byte{0x00, 0x00})
+		// Server writes 2-byte length + payload "pong" (00 04 pong)
+		respFrame := []byte{0x00, 0x04, 'p', 'o', 'n', 'g'}
+		_, _ = serverConn.Write(respFrame)
+	}()
+
+	// Write UDP datagram "ping"
+	n, err := vConn.Write([]byte("ping"))
+	if err != nil {
+		t.Fatalf("Write UDP failed: %v", err)
+	}
+	if n != 4 {
+		t.Errorf("Expected 4 bytes written, got %d", n)
+	}
+
+	// Read UDP datagram "pong"
+	buf := make([]byte, 65535)
+	rn, err := vConn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read UDP failed: %v", err)
+	}
+	if rn != 4 || string(buf[:rn]) != "pong" {
+		t.Errorf("Expected pong (4 bytes), got %s (%d bytes)", string(buf[:rn]), rn)
+	}
+}
+
+func TestRealityRejectsRogueServer(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("Failed to generate test cert: %v", err)
+	}
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsConfig)
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	portNum, _ := strconv.Atoi(portStr)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+	pubKeyBase64 := base64.RawURLEncoding.EncodeToString(priv.PublicKey().Bytes())
+
+	vlessCfg := &config.VLESSConfig{
+		Server:     "127.0.0.1",
+		Port:       portNum,
+		UUID:       "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+		ServerName: "127.0.0.1",
+		PublicKey:  pubKeyBase64,
+	}
+
+	dialer := NewDialer(vlessCfg)
+	_, err = dialer.Dial("tcp", "target-domain.com:443")
+	if err == nil {
+		t.Fatal("Expected Reality handshake with unauthenticated rogue server to fail, but it succeeded")
 	}
 }

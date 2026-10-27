@@ -288,11 +288,45 @@ func (st *Stack) forwardUDP(localConn net.Conn, destIP net.IP, destPort uint16) 
 	}
 	defer remoteConn.Close()
 
-	_ = localConn.SetDeadline(time.Now().Add(30 * time.Second))
-	_ = remoteConn.SetDeadline(time.Now().Add(30 * time.Second))
+	done := make(chan struct{}, 2)
 
+	// local -> remote
 	go func() {
-		_, _ = io.Copy(remoteConn, localConn)
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 65535)
+		for {
+			_ = localConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := localConn.Read(buf)
+			if n > 0 {
+				_ = remoteConn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+				if _, werr := remoteConn.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
 	}()
-	_, _ = io.Copy(localConn, remoteConn)
+
+	// remote -> local
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 65535)
+		for {
+			_ = remoteConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := remoteConn.Read(buf)
+			if n > 0 {
+				_ = localConn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+				if _, werr := localConn.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	<-done
 }

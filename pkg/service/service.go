@@ -89,13 +89,19 @@ func Install(binPath string) error {
 </plist>
 `, MacLabel, absBin)
 
-		tmpFile := "/tmp/com.smartnet.daemon.plist"
-		if err := os.WriteFile(tmpFile, []byte(plistContent), 0644); err != nil {
+		tmpDir, err := os.MkdirTemp("", "smartnet-svc-*")
+		if err != nil {
+			return fmt.Errorf("failed to create secure temp dir: %w", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		tmpFile := filepath.Join(tmpDir, "daemon.plist")
+		if err := os.WriteFile(tmpFile, []byte(plistContent), 0600); err != nil {
 			return err
 		}
 
-		script := fmt.Sprintf("cp %s %s && chown root:wheel %s && chmod 644 %s && rm -f %s",
-			tmpFile, MacPlistPath, MacPlistPath, MacPlistPath, tmpFile)
+		script := fmt.Sprintf("cp %s %s && chown root:wheel %s && chmod 644 %s",
+			tmpFile, MacPlistPath, MacPlistPath, MacPlistPath)
 		if _, err := runElevated("sh", "-c", script); err != nil {
 			return fmt.Errorf("failed to install plist: %w", err)
 		}
@@ -120,20 +126,26 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
 `, absBin)
 
-		tmpFile := "/tmp/smartnet.service"
-		if err := os.WriteFile(tmpFile, []byte(unitContent), 0644); err != nil {
+		tmpDir, err := os.MkdirTemp("", "smartnet-svc-*")
+		if err != nil {
+			return fmt.Errorf("failed to create secure temp dir: %w", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		tmpFile := filepath.Join(tmpDir, "smartnet.service")
+		if err := os.WriteFile(tmpFile, []byte(unitContent), 0600); err != nil {
 			return err
 		}
 
-		script := fmt.Sprintf("cp %s %s && systemctl daemon-reload && systemctl enable --now smartnet && rm -f %s",
-			tmpFile, LinuxUnit, tmpFile)
+		script := fmt.Sprintf("cp %s %s && chmod 644 %s && systemctl daemon-reload && systemctl enable --now smartnet",
+			tmpFile, LinuxUnit, LinuxUnit)
 		if _, err := runElevated("sh", "-c", script); err != nil {
 			return fmt.Errorf("failed to install systemd unit: %w", err)
 		}

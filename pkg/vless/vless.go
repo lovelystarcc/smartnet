@@ -6,8 +6,12 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -69,6 +73,10 @@ func ParseURL(rawURL string) (*config.VLESSConfig, error) {
 		SpiderX:    q.Get("spx"),
 	}
 
+	if cfg.Flow != "" && cfg.Flow != "none" {
+		return nil, fmt.Errorf("unsupported VLESS flow %q: xtls-rprx-vision is not supported, configure VLESS without flow", cfg.Flow)
+	}
+
 	if cfg.ServerName == "" {
 		cfg.ServerName = server
 	}
@@ -78,7 +86,8 @@ func ParseURL(rawURL string) (*config.VLESSConfig, error) {
 
 // Dialer establishes outbound connections over VLESS-Reality.
 type Dialer struct {
-	cfg *config.VLESSConfig
+	cfg     *config.VLESSConfig
+	rootCAs *x509.CertPool
 }
 
 // NewDialer creates a new VLESS dialer.
@@ -111,7 +120,8 @@ func (d *Dialer) DialContext(ctx context.Context, network, target string) (net.C
 	} else {
 		tlsConfig := &tls.Config{
 			ServerName:         d.cfg.ServerName,
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: false,
+			RootCAs:            d.rootCAs,
 		}
 		stdConn := tls.Client(rawConn, tlsConfig)
 		if err := stdConn.HandshakeContext(ctx); err != nil {
@@ -122,8 +132,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, target string) (net.C
 	}
 
 	// Build and send VLESS request header
+	isUDP := strings.HasPrefix(network, "udp")
 	cmd := byte(0x01) // TCP
-	if strings.HasPrefix(network, "udp") {
+	if isUDP {
 		cmd = byte(0x02) // UDP
 	}
 
@@ -138,39 +149,94 @@ func (d *Dialer) DialContext(ctx context.Context, network, target string) (net.C
 		return nil, fmt.Errorf("failed to send VLESS header: %w", err)
 	}
 
-	return &vlessConn{Conn: tlsConn}, nil
+	return &vlessConn{Conn: tlsConn, isUDP: isUDP}, nil
 }
 
 type vlessConn struct {
 	net.Conn
 	mu         sync.Mutex
 	headerRead bool
+	isUDP      bool
+	udpBuf     []byte
 }
 
 func (c *vlessConn) Read(b []byte) (int, error) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if !c.headerRead {
 		respHdr := make([]byte, 2)
 		if _, err := io.ReadFull(c.Conn, respHdr); err != nil {
-			c.mu.Unlock()
 			return 0, fmt.Errorf("failed to read VLESS response header: %w", err)
 		}
 		if respHdr[0] != 0x00 {
-			c.mu.Unlock()
 			return 0, fmt.Errorf("unsupported VLESS response version: %d", respHdr[0])
 		}
 		addonLen := int(respHdr[1])
 		if addonLen > 0 {
 			addonBuf := make([]byte, addonLen)
 			if _, err := io.ReadFull(c.Conn, addonBuf); err != nil {
-				c.mu.Unlock()
 				return 0, fmt.Errorf("failed to read VLESS addon bytes: %w", err)
 			}
 		}
 		c.headerRead = true
 	}
-	c.mu.Unlock()
-	return c.Conn.Read(b)
+
+	if !c.isUDP {
+		return c.Conn.Read(b)
+	}
+
+	// For UDP: return remaining buffered bytes from an earlier read
+	if len(c.udpBuf) > 0 {
+		n := copy(b, c.udpBuf)
+		c.udpBuf = c.udpBuf[n:]
+		return n, nil
+	}
+
+	// Read 2-byte datagram length prefix
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(c.Conn, lenBuf[:]); err != nil {
+		return 0, err
+	}
+	packetLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+	if packetLen == 0 {
+		return 0, nil
+	}
+
+	packet := make([]byte, packetLen)
+	if _, err := io.ReadFull(c.Conn, packet); err != nil {
+		return 0, err
+	}
+
+	n := copy(b, packet)
+	if n < packetLen {
+		c.udpBuf = packet[n:]
+	}
+	return n, nil
+}
+
+func (c *vlessConn) Write(b []byte) (int, error) {
+	if !c.isUDP {
+		return c.Conn.Write(b)
+	}
+
+	if len(b) > 0xFFFF {
+		return 0, fmt.Errorf("UDP packet exceeds 65535 bytes: %d", len(b))
+	}
+
+	// UDP framing: 2-byte big-endian length prefix followed by datagram payload
+	frame := make([]byte, 2+len(b))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(b)))
+	copy(frame[2:], b)
+
+	n, err := c.Conn.Write(frame)
+	if err != nil {
+		return 0, err
+	}
+	if n < 2 {
+		return 0, io.ErrShortWrite
+	}
+	return n - 2, nil
 }
 
 func parseUUID(uuidStr string) ([]byte, error) {
@@ -243,10 +309,33 @@ func realityHandshake(ctx context.Context, rawConn net.Conn, cfg *config.VLESSCo
 		}
 	}
 
+	var verified bool
+	authKey := make([]byte, 32)
+
 	uConn := utls.UClient(rawConn, &utls.Config{
 		ServerName:             cfg.ServerName,
 		InsecureSkipVerify:     true,
 		SessionTicketsDisabled: true,
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("reality: no peer certificate presented")
+			}
+			cert, err := x509.ParseCertificate(rawCerts[0])
+			if err != nil {
+				return fmt.Errorf("reality: failed to parse peer certificate: %w", err)
+			}
+			pub, ok := cert.PublicKey.(ed25519.PublicKey)
+			if !ok {
+				return fmt.Errorf("reality: server certificate public key is not ed25519; server authentication failed")
+			}
+			h := hmac.New(sha512.New, authKey)
+			h.Write(pub)
+			if !bytes.Equal(h.Sum(nil), cert.Signature) {
+				return fmt.Errorf("reality: certificate signature mismatch; server authentication failed")
+			}
+			verified = true
+			return nil
+		},
 	}, utls.HelloChrome_Auto)
 
 	if err := uConn.BuildHandshakeState(); err != nil {
@@ -255,7 +344,7 @@ func realityHandshake(ctx context.Context, rawConn net.Conn, cfg *config.VLESSCo
 
 	hello := uConn.HandshakeState.Hello
 	hello.SessionId = make([]byte, 32)
-	copy(hello.Raw[39:], hello.SessionId) // КРИТИЧНО: зануляем AAD в сыром ClientHello
+	copy(hello.Raw[39:], hello.SessionId) // Clear AAD in raw ClientHello
 
 	hello.SessionId[0] = 1
 	hello.SessionId[1] = 8
@@ -284,7 +373,6 @@ func realityHandshake(ctx context.Context, rawConn net.Conn, cfg *config.VLESSCo
 		return nil, fmt.Errorf("reality ECDH exchange failed: %w", err)
 	}
 
-	authKey := make([]byte, 32)
 	if _, err := hkdf.New(sha256.New, sharedKey, hello.Random[:20], []byte("REALITY")).Read(authKey); err != nil {
 		return nil, fmt.Errorf("reality HKDF key derivation failed: %w", err)
 	}
@@ -304,6 +392,9 @@ func realityHandshake(ctx context.Context, rawConn net.Conn, cfg *config.VLESSCo
 
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("reality TLS handshake failed with %s: %w", cfg.ServerName, err)
+	}
+	if !verified {
+		return nil, fmt.Errorf("reality: server authentication failed")
 	}
 	return uConn, nil
 }
